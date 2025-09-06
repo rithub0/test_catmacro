@@ -1,67 +1,68 @@
 ' Language="VBSCRIPT"
 ' ============================================================
-' CATScript: Uturn(180°arc + 2 lines) & Iturn(inside U; 3 lines with two right angles)
-' Extract → Measure → Excel(.xlsx)
-' - U arc radius: 1–2 mm
-' - Min spacing between accepted patterns: 100 mm (anchor = U arc center)
-' - Per-pattern snapshot: Select items → ReframeOnSelection → Capture
-' - Single Excel sheet "Report": left=Results table, right=Snapshots
+' 3D U/I Extractor → Check → HTML report (+ PNG snapshots)
+'   - Input: Part/Product 3D モデル
+'   - Find: Uturn = 半円弧(≈180°) + 端点接続の直線×2（同一フェース上）
+'           Iturn = U内部のコの字（直角×2の直線×3、同一フェース上）
+'   - Check: 半径・直角・内側性（半円内の半平面条件）、U-I距離（最短）
+'   - Output: /Report.html（表+サムネ）、/snaps/*.png
 ' ============================================================
 
 Option Explicit
 
+' ==================== 設定（要件に合わせて調整） ====================
+Const R_MIN          = 1.0      ' U弧 半径最小[mm]
+Const R_MAX          = 2.0      ' U弧 半径最大[mm]
+Const TOL_DEG_ARC    = 1.0      ' 半円判定 180°±[deg]
+Const TOL_RIGHT_DEG  = 3.0      ' 直角判定 90°±[deg]
+Const TOL_JOIN       = 0.02     ' 端点一致 tol [mm]
+Const MIN_SPACING3D  = 100.0    ' 採用パターン間の最小距離(3D, U中心同士) [mm]
+
+Const ENABLE_SNAPS   = True     ' スナップ撮影ON/OFF
+Const SNAP_EVERY_N   = 1        ' 何件に1回撮る（1=毎回）
+Const SNAP_MAX       = 200      ' 最大撮影枚数
+Const SNAP_HEIGHT_PX = 240      ' HTMLサムネ高さ
+Const OUT_DIR        = "C:\temp\ui3d_report" ' 出力フォルダ
+
+' ==================== 内部状態 ====================
+Dim gSnapCount : gSnapCount = 0
+Dim gPatCount  : gPatCount  = 0
+
+' ============================================================
 Sub CATMain()
+
   Dim app : Set app = CATIA
   If app Is Nothing Then MsgBox "CATIAが見つかりません": Exit Sub
 
   Dim doc : Set doc = app.ActiveDocument
   If doc Is Nothing Then MsgBox "ドキュメントを開いてください": Exit Sub
 
-  ' ===== 設定 =====
-  Dim NameLikeU : NameLikeU = "Uturn*"    ' フィルタ（空で無視）
-  Dim NameLikeI : NameLikeI = "Iturn*"
-  Dim Rmin      : Rmin      = 1#
-  Dim Rmax      : Rmax      = 2#
-  Dim TolAngDeg : TolAngDeg = 0.5         ' 180°±0.5°
-  Dim TolXY     : TolXY     = 0.01        ' 端点一致 tol
-  Dim TolRight  : TolRight  = 3#          ' 直角 ±3°
-  Dim MinSpacing: MinSpacing= 100#        ' mm（U円弧中心で判定）
-  Dim OutPath   : OutPath   = "U_I_report.xlsx"
-  Dim SnapDir   : SnapDir   = "ui_snaps"  ' 画像保存先
-  Dim SnapshotHeight : SnapshotHeight : SnapshotHeight = 240 ' Excel貼付時の高さ(px)
-  ' ===============
+  EnsureFolder OUT_DIR
+  EnsureFolder OUT_DIR & "\snaps"
 
-  EnsureFolder SnapDir
-
-  ' 計測行（左表）
-  Dim rows : Set rows = CreateObject("Scripting.Dictionary")
-  ' 列: [Doc,Part,Body,Sketch,Pattern, U_ID,U_R,U_Ang,U_L1,U_L2,U_Opening,
-  '      I_ID,I_La,I_Lb,I_Lc,I_RightOK, U2I_L1_Min,U2I_L2_Min,U2I_Min, SnapLabel]
-
-  ' スナップ（右側）：label -> imgPath
-  Dim snaps : Set snaps = CreateObject("Scripting.Dictionary")
-
-  ' パターン間隔チェック用アンカー（U arc center）
-  Dim anchors : Set anchors = CreateObject("Scripting.Dictionary")
+  Dim rows : Set rows = CreateObject("System.Collections.ArrayList")
+  ' rows: Array( Doc, Part, FaceId, Pattern, U_R, U_Ang, U_L1, U_L2, Opening,  _
+  '              I_La, I_Lb, I_Lc, RightOK, U2I_Min, SnapRelPath )
 
   Select Case TypeName(doc)
     Case "PartDocument"
-      ProcessPart doc, NameLikeU, NameLikeI, Rmin, Rmax, TolAngDeg, TolXY, TolRight, MinSpacing, anchors, rows, snaps, SnapDir, SnapshotHeight
+      ScanPart3D doc, rows
     Case "ProductDocument"
-      ProcessProduct doc, NameLikeU, NameLikeI, Rmin, Rmax, TolAngDeg, TolXY, TolRight, MinSpacing, anchors, rows, snaps, SnapDir, SnapshotHeight
+      ScanProduct3D doc, rows
     Case Else
       MsgBox "Part または Product を開いてください": Exit Sub
   End Select
 
-  ExportExcelOneSheet rows, snaps, OutPath, SnapshotHeight
-  MsgBox "完了: 行数=" & rows.Count & vbCrLf & "出力: " & OutPath
+  BuildHtmlReport rows, OUT_DIR & "\Report.html"
+  MsgBox "完了: " & rows.Count & " 件" & vbCrLf & OUT_DIR & "\Report.html"
+
 End Sub
 
-' ---------------- Product配下 ----------------
-Sub ProcessProduct(prodDoc, NameLikeU, NameLikeI, Rmin, Rmax, TolAngDeg, TolXY, TolRight, MinSpacing, anchors, rows, snaps, SnapDir, SnapshotHeight)
+' ============================================================
+' Product配下パートを順次処理
+Sub ScanProduct3D(prodDoc, rows)
   Dim prod : Set prod = prodDoc.Product
   If prod Is Nothing Then Exit Sub
-
   Dim i
   For i = 1 To prod.Products.Count
     Dim child : Set child = prod.Products.Item(i)
@@ -69,357 +70,473 @@ Sub ProcessProduct(prodDoc, NameLikeU, NameLikeI, Rmin, Rmax, TolAngDeg, TolXY, 
       Dim refDoc : Set refDoc = child.ReferenceProduct.Parent
       If Not refDoc Is Nothing Then
         If TypeName(refDoc) = "PartDocument" Then
-          ProcessPart refDoc, NameLikeU, NameLikeI, Rmin, Rmax, TolAngDeg, TolXY, TolRight, MinSpacing, anchors, rows, snaps, SnapDir, SnapshotHeight
+          ScanPart3D refDoc, rows
         End If
       End If
     End If
   Next
 End Sub
 
-' ---------------- Part内 ----------------
-Sub ProcessPart(partDoc, NameLikeU, NameLikeI, Rmin, Rmax, TolAngDeg, TolXY, TolRight, MinSpacing, anchors, rows, snaps, SnapDir, SnapshotHeight)
+' ============================================================
+' 1 Part を全フェース走査 → エッジ分類 → U/I検出 → 記録
+Sub ScanPart3D(partDoc, rows)
+
   Dim part : Set part = partDoc.Part
-  If part Is Nothing Then Exit Sub
+  Dim sel  : Set sel  = partDoc.Selection
+  Dim spa  : Set spa  = partDoc.GetWorkbench("SPAWorkbench")
 
-  Dim bodies : Set bodies = part.Bodies
-  Dim b
-  For b = 1 To bodies.Count
-    Dim body : Set body = bodies.Item(b)
-    Dim sketches
+  sel.Clear
+  sel.Search "Topology.Face,all"   ' 全フェース収集（トップロジ）  :contentReference[oaicite:5]{index=5}
+  If sel.Count = 0 Then Exit Sub
+
+  Dim f
+  For f = 1 To sel.Count
+
+    ' ---- フェース基底情報（原点・面内2軸） ----
+    Dim faceRef : Set faceRef = sel.Item(f).Reference
+    Dim measF   : Set measF   = spa.GetMeasurable(faceRef)
+    Dim pl()    : ReDim pl(8)
     On Error Resume Next
-    Set sketches = body.Sketches
+    measF.GetPlane pl  ' origin(0..2), dir1(3..5), dir2(6..8)  :contentReference[oaicite:6]{index=6}
+    If Err.Number <> 0 Then Err.Clear: GoTo nextFace
     On Error GoTo 0
-    If Not sketches Is Nothing Then
-      Dim s
-      For s = 1 To sketches.Count
-        Dim sk : Set sk = sketches.Item(s)
-        AnalyzeSketch partDoc, part, body, sk, NameLikeU, NameLikeI, Rmin, Rmax, TolAngDeg, TolXY, TolRight, MinSpacing, anchors, rows, snaps, SnapDir, SnapshotHeight
-      Next
-    End If
-  Next
-End Sub
 
-' ---------------- スケッチ解析（抽出・計測・間隔・スナップ） ----------------
-Sub AnalyzeSketch(partDoc, part, body, sk, NameLikeU, NameLikeI, Rmin, Rmax, TolAngDeg, TolXY, TolRight, MinSpacing, anchors, rows, snaps, SnapDir, SnapshotHeight)
-  Dim geos : Set geos = sk.GeometricElements
-  If geos Is Nothing Then Exit Sub
+    Dim fOrigin(2), uDir(2), vDir(2)
+    fOrigin(0)=pl(0): fOrigin(1)=pl(1): fOrigin(2)=pl(2)
+    uDir(0)=pl(3): uDir(1)=pl(4): uDir(2)=pl(5)
+    vDir(0)=pl(6): vDir(1)=pl(7): vDir(2)=pl(8)
+    NormVec uDir: NormVec vDir
 
-  Dim useU : useU = (Len(NameLikeU) > 0)
-  Dim useI : useI = (Len(NameLikeI) > 0)
-  Dim sketchHasU : sketchHasU = (Not useU) Or (SafeLike(sk.Name, NameLikeU))
-  Dim sketchHasI : sketchHasI = (Not useI) Or (SafeLike(sk.Name, NameLikeI))
+    ' ---- このフェースのエッジを列挙 ----
+    Dim edges : Set edges = CreateObject("System.Collections.ArrayList")
+    Dim eSel  : Set eSel  = partDoc.Selection
+    eSel.Clear
+    eSel.Add faceRef
+    eSel.Search "Topology.Edge,sel" ' face の境界エッジ群  :contentReference[oaicite:7]{index=7}
 
-  Dim lines : Set lines = CreateObject("Scripting.Dictionary") ' k -> dict{..., obj}
-  Dim arcs  : Set arcs  = CreateObject("Scripting.Dictionary") ' k -> dict{..., obj}
+    Dim e
+    For e = 1 To eSel.Count
+      Dim eref : Set eref = eSel.Item(e).Reference
+      Dim em   : Set em   = spa.GetMeasurable(eref)
 
-  Dim i
-  For i = 1 To geos.Count
-    Dim g : Set g = geos.Item(i)
-    Dim tn : tn = SafeTypeName(g)
+      Dim okEdge : okEdge = False
+      Dim ed
+      Set ed = CreateObject("Scripting.Dictionary")
+      ed("ref") = eref
 
-    If tn = "Line2D" Then
-      Dim L : Set L = CreateObject("Scripting.Dictionary")
-      FillLine2D g, L
-      If GetBool(L,"ok") Then
-        L("name") = g.Name
-        L("obj")  = g
-        lines.Add CStr(lines.Count+1), L
+      ' 端点・中点（3D）
+      Dim p() : ReDim p(8)
+      On Error Resume Next
+      em.GetPointsOnCurve p ' start(0..2), mid(3..5), end(6..8)  :contentReference[oaicite:8]{index=8}
+      If Err.Number = 0 Then
+        ed("p0") = Arr3(p(0),p(1),p(2))
+        ed("pm") = Arr3(p(3),p(4),p(5))
+        ed("p1") = Arr3(p(6),p(7),p(8))
+        okEdge = True
       End If
+      Err.Clear
+      On Error GoTo 0
+      If Not okEdge Then GoTo nextEdge
 
-    ElseIf tn = "Arc2D" Or tn = "Circle2D" Then
-      Dim A : Set A = CreateObject("Scripting.Dictionary")
-      FillArc2D g, A
-      If GetBool(A,"ok") Then
-        If (A("r") >= Rmin And A("r") <= Rmax) And (Abs(A("degSpan") - 180#) <= TolAngDeg) Then
-          A("name") = g.Name
-          A("obj")  = g
-          arcs.Add CStr(arcs.Count+1), A
+      ' 長さ
+      Dim elen : elen = 0#
+      On Error Resume Next
+      elen = em.Length   ' ㎜  :contentReference[oaicite:9]{index=9}
+      On Error GoTo 0
+      ed("len") = CDbl(elen)
+
+      ' 半径（円弧なら成功）
+      Dim rad : rad = -1#
+      On Error Resume Next
+      rad = em.Radius    ' 円/球/円筒 or 円弧  :contentReference[oaicite:10]{index=10}
+      On Error GoTo 0
+
+      If rad > 0 Then
+        ' 円弧エッジと仮定：弧角 ≒ 長さ/半径
+        Dim angDeg : angDeg = (ed("len")/rad) * 180# / 3.141592653589793#
+        ed("type") = "ARC"
+        ed("r")    = rad
+        ed("ang")  = angDeg
+        ' 中心（取得できる場合のみ）
+        On Error Resume Next
+        Dim cc() : ReDim cc(2)
+        em.GetCenter cc  ' CIRCLE/Sphere系  :contentReference[oaicite:11]{index=11}
+        If Err.Number = 0 Then ed("c") = Arr3(cc(0),cc(1),cc(2))
+        Err.Clear: On Error GoTo 0
+      Else
+        ' 直線性：start-mid-end が十分一直線なら LINE とみなす
+        Dim isLine : isLine = Collinear(ed("p0"), ed("pm"), ed("p1"), 0.01, 0.5) ' [mm], [deg]
+        If isLine Then
+          ed("type") = "LINE"
+        Else
+          ed("type") = "CURVE" ' スプライン等、今回は不採用
         End If
       End If
-    End If
-  Next
 
-  If arcs.Count = 0 Then Exit Sub
+      edges.Add ed
+nextEdge:
+    Next
 
-  Dim ak
-  For Each ak In arcs.Keys
-    Dim U : Set U = arcs(ak)
+    If edges.Count = 0 Then GoTo nextFace
 
-    ' 名前条件（U）
-    Dim namePassU : namePassU
-    namePassU = sketchHasU
-    If (Not namePassU) And (Len(NameLikeU) > 0) Then namePassU = SafeLike(U("name"), NameLikeU)
-    If Not (useU And Not namePassU) Then
-
-      ' U端点と直線
-      Dim sx,sy,ex,ey : ArcEndpoints U("cx"),U("cy"),U("r"),U("a0"),U("a1"), sx,sy, ex,ey
-
-      Dim kL1,kL2, L1ox,L1oy,L2ox,L2oy, L1len,L2len, L1name,L2name
-      Dim f1 : f1 = FindLineAtPointKey(lines, sx, sy, TolXY, kL1, L1ox, L1oy, L1len, L1name)
-      Dim f2 : f2 = FindLineAtPointKey(lines, ex, ey, TolXY, kL2, L2ox, L2oy, L2len, L2name)
-
-      If f1 And f2 Then
-        Dim opening : opening = Dist2D(L1ox,L1oy, L2ox,L2oy)
-        Dim u_id : u_id = sk.Name & ":U" & ak
-
-        ' ====== 間隔チェック（U arc center） ======
-        If IsFarEnough(anchors, U("cx"), U("cy"), MinSpacing) Then
-
-          ' ====== Iturn検出 ======
-          Dim foundI : foundI = False
-          Dim lk
-          For Each lk In lines.Keys
-            Dim Lb : Set Lb = lines(lk)
-            Dim sNg : Set sNg = RightAngleNeighborsAt(lines, Lb, True,  TolXY, TolRight)
-            Dim eNg : Set eNg = RightAngleNeighborsAt(lines, Lb, False, TolXY, TolRight)
-            If sNg.Count > 0 And eNg.Count > 0 Then
-
-              Dim sk1, sk2
-              For Each sk1 In sNg.Keys
-                For Each sk2 In eNg.Keys
-                  If sk1 <> sk2 Then
-                    Dim La : Set La = lines(sk1)
-                    Dim Lc : Set Lc = lines(sk2)
-
-                    ' I主要点がU円内
-                    Dim aFx,aFy, cFx,cFy
-                    FreeEndOppositeTo La, Lb, TolXY, aFx, aFy
-                    FreeEndOppositeTo Lc, Lb, TolXY, cFx, cFy
-                    Dim inside : inside = _
-                        InsideCircle(U("cx"),U("cy"),U("r")-0.001, Lb("x1"),Lb("y1")) And _
-                        InsideCircle(U("cx"),U("cy"),U("r")-0.001, Lb("x2"),Lb("y2")) And _
-                        InsideCircle(U("cx"),U("cy"),U("r")-0.001, aFx,aFy) And _
-                        InsideCircle(U("cx"),U("cy"),U("r")-0.001, cFx,cFy)
-
-                    If inside Then
-                      ' U直線 vs I直線 のセグメント最短距離
-                      Dim UL1 : Set UL1 = lines(kL1)
-                      Dim UL2 : Set UL2 = lines(kL2)
-
-                      Dim dL1a : dL1a = DistSegToSeg(UL1, La)
-                      Dim dL1b : dL1b = DistSegToSeg(UL1, Lb)
-                      Dim dL1c : dL1c = DistSegToSeg(UL1, Lc)
-                      Dim U2I_L1_Min : U2I_L1_Min = Min3(dL1a, dL1b, dL1c)
-
-                      Dim dL2a : dL2a = DistSegToSeg(UL2, La)
-                      Dim dL2b : dL2b = DistSegToSeg(UL2, Lb)
-                      Dim dL2c : dL2c = DistSegToSeg(UL2, Lc)
-                      Dim U2I_L2_Min : U2I_L2_Min = Min3(dL2a, dL2b, dL2c)
-
-                      Dim U2I_Min : U2I_Min = IIf(U2I_L1_Min < U2I_L2_Min, U2I_L1_Min, U2I_L2_Min)
-
-                      Dim rightOK : rightOK = "OK"
-                      Dim i_id : i_id = sk.Name & ":I" & lk & "-" & sk1 & "-" & sk2
-
-                      ' === スナップショット（パターン単位・選択→ReframeOnSelection） ===
-                      Dim snapLabel : snapLabel = u_id & " + " & i_id
-                      Dim imgPath   : imgPath   = SnapDir & "\" & SanitizeFileName(snapLabel) & ".png"
-                      CapturePatternSnapshot partDoc, Array(U("obj"), UL1("obj"), UL2("obj"), La("obj"), Lb("obj"), Lc("obj")), imgPath
-                      If Not snaps.Exists(snapLabel) Then snaps.Add snapLabel, imgPath
-
-                      ' === 行追加 ===
-                      Dim rec
-                      rec = Array( _
-                        partDoc.Name, part.Name, body.Name, sk.Name, "U+I", _
-                        u_id, Round(U("r"),3), Round(U("degSpan"),3), Round(L1len,3), Round(L2len,3), Round(opening,3), _
-                        i_id, Round(La("len"),3), Round(Lb("len"),3), Round(Lc("len"),3), rightOK, _
-                        Round(U2I_L1_Min,3), Round(U2I_L2_Min,3), Round(U2I_Min,3), snapLabel _
-                      )
-                      rows.Add CStr(rows.Count+1), rec
-                      foundI = True
-                      AddAnchor anchors, U("cx"), U("cy")
-                    End If
-                  End If
-                Next
-              Next
-
+    ' ---- U候補（半径/弧角チェック）抽出 ----
+    Dim arcs : Set arcs = CreateObject("System.Collections.ArrayList")
+    Dim lines: Set lines= CreateObject("System.Collections.ArrayList")
+    Dim i
+    For i = 0 To edges.Count-1
+      Dim ei : Set ei = edges(i)
+      If ei.Exists("type") Then
+        If ei("type") = "ARC" Then
+          If ei.Exists("r") And ei.Exists("ang") Then
+            If ei("r")>=R_MIN And ei("r")<=R_MAX And Abs(ei("ang")-180#)<=TOL_DEG_ARC Then
+              arcs.Add ei
             End If
-          Next
-
-          If Not foundI Then
-            ' U単独：スナップはU構成要素のみ
-            Dim snapLabelU : snapLabelU = u_id
-            Dim imgPathU   : imgPathU   = SnapDir & "\" & SanitizeFileName(snapLabelU) & ".png"
-            CapturePatternSnapshot partDoc, Array(U("obj"), lines(kL1)("obj"), lines(kL2)("obj")), imgPathU
-            If Not snaps.Exists(snapLabelU) Then snaps.Add snapLabelU, imgPathU
-
-            Dim recU
-            recU = Array( _
-              partDoc.Name, part.Name, body.Name, sk.Name, "U", _
-              u_id, Round(U("r"),3), Round(U("degSpan"),3), Round(L1len,3), Round(L2len,3), Round(opening,3), _
-              "", "", "", "", "", "", "", "", snapLabelU _
-            )
-            rows.Add CStr(rows.Count+1), recU
-            AddAnchor anchors, U("cx"), U("cy")
           End If
+        ElseIf ei("type") = "LINE" Then
+          lines.Add ei
+        End If
+      End If
+    Next
+    If arcs.Count = 0 Then GoTo nextFace
 
-        End If ' spacing
+    ' ---- 端点インデックス（端点一致を高速判定） ----
+    Dim endMap : Set endMap = CreateObject("Scripting.Dictionary")
+    For i = 0 To edges.Count-1
+      Dim e0 : Set e0 = edges(i)
+      If Not e0.Exists("p0") Then Continue For
+      AddEndKey endMap, e0, "p0"
+      AddEndKey endMap, e0, "p1"
+    Next
 
-      End If ' f1 & f2
+    ' ---- U検出（半円弧 + その両端と接続する直線×2） ----
+    Dim uList : Set uList = CreateObject("System.Collections.ArrayList")
+    For i = 0 To arcs.Count-1
+      Dim ua : Set ua = arcs(i)
+      Dim u_p0 : u_p0 = KeyOfPoint(ua("p0"))
+      Dim u_p1 : u_p1 = KeyOfPoint(ua("p1"))
+      Dim candL1 : Set candL1 = LinesAtKey(lines, endMap, u_p0)
+      Dim candL2 : Set candL2 = LinesAtKey(lines, endMap, u_p1)
+      If candL1.Count=0 Or candL2.Count=0 Then Continue For
 
-    End If ' name filter
-  Next
+      ' 最初の組を採用（必要なら最短/最長などで最良組選定に拡張）
+      Dim UL1 : Set UL1 = candL1(0)
+      Dim UL2 : Set UL2 = candL2(0)
+
+      ' U開口：UL1自由端とUL2自由端の距離（フェース2Dで測る）
+      Dim c2() : c2 = EnsureCenter(ua, fOrigin, uDir, vDir)
+      Dim l1_free() : l1_free = FreeEnd2D(UL1, ua("p0"), uDir, vDir, fOrigin)
+      Dim l2_free() : l2_free = FreeEnd2D(UL2, ua("p1"), uDir, vDir, fOrigin)
+      Dim opening : opening = Dist2D(l1_free(0),l1_free(1), l2_free(0),l2_free(1))
+
+      ' Uパターン 1件
+      Dim urec : Set urec = CreateObject("Scripting.Dictionary")
+      urec("arc") = ua
+      urec("L1")  = UL1
+      urec("L2")  = UL2
+      urec("opening") = opening
+      urec("center")  = EnsureCenter(ua) ' 3D中心（無ければ近似後で補う）
+      uList.Add urec
+    Next
+
+    If uList.Count = 0 Then GoTo nextFace
+
+    ' ---- U/I間隔（3D中心）で間引き ----
+    Dim acceptedU : Set acceptedU = CreateObject("System.Collections.ArrayList")
+    Dim anchors : Set anchors = CreateObject("System.Collections.ArrayList") ' 3D点配列
+    For i = 0 To uList.Count-1
+      Dim ux : Set ux = uList(i)
+      Dim uc() : uc = ux("center")
+      If IsFarFromAnchors(anchors, uc, MIN_SPACING3D) Then
+        acceptedU.Add ux
+        anchors.Add uc
+      End If
+    Next
+    If acceptedU.Count = 0 Then GoTo nextFace
+
+    ' ---- I検出（U内のコの字：中央線Lbの両端に直角で接続） ----
+    Dim j
+    For j = 0 To acceptedU.Count-1
+      Dim U : Set U = acceptedU(j)
+      Dim UA : Set UA = U("arc")
+      Dim UL1: Set UL1 = U("L1")
+      Dim UL2: Set UL2 = U("L2")
+
+      ' 半円内部の半平面条件を定義（フェース2D基準）
+      Dim cx2,cy2, bUx,bUy
+      Dim sc() : sc = SemiPlaneForArc(UA, fOrigin, uDir, vDir, cx2, cy2, bUx, bUy)
+
+      ' I候補探索：フェース内の直線から中央線候補Lbを選ぶ
+      Dim k
+      Dim foundI : foundI = False
+      For k = 0 To lines.Count-1
+        Dim Lb : Set Lb = lines(k)
+        ' Lbの両端2D
+        Dim Lb0() : Lb0 = Proj2D(Lb("p0"), fOrigin, uDir, vDir)
+        Dim Lb1() : Lb1 = Proj2D(Lb("p1"), fOrigin, uDir, vDir)
+        ' 端点がU半円内か（円内 + ビセクタ半平面）
+        If Not (InSemiCircle(Lb0(0),Lb0(1), cx2,cy2, bUx,bUy, UA("r"))) Then Continue For
+        If Not (InSemiCircle(Lb1(0),Lb1(1), cx2,cy2, bUx,bUy, UA("r"))) Then Continue For
+
+        ' Lbの両端それぞれに「直角接続する別線」を探す
+        Dim sNg : Set sNg = RightNeighbors(lines, Lb, True,  fOrigin, uDir, vDir, TOL_JOIN, TOL_RIGHT_DEG)
+        Dim eNg : Set eNg = RightNeighbors(lines, Lb, False, fOrigin, uDir, vDir, TOL_JOIN, TOL_RIGHT_DEG)
+        If sNg.Count=0 Or eNg.Count=0 Then Continue For
+
+        ' 組合せから1組採用
+        Dim La : Set La = sNg(0)
+        Dim Lc : Set Lc = eNg(0)
+
+        ' 自由端2点もU半円内か確認
+        Dim aFree() : aFree = FreeEnd2DAgainst(L a, Lb, fOrigin, uDir, vDir, TOL_JOIN)
+        Dim cFree() : cFree = FreeEnd2DAgainst(L c, Lb, fOrigin, uDir, vDir, TOL_JOIN)
+        If Not (InSemiCircle(aFree(0),aFree(1), cx2,cy2, bUx,bUy, UA("r"))) Then Continue For
+        If Not (InSemiCircle(cFree(0),cFree(1), cx2,cy2, bUx,bUy, UA("r"))) Then Continue For
+
+        ' U↔I 距離（最小）を計測（3D最短距離）
+        Dim dMin : dMin = MinUtoILines(part, UL1, UL2, La, Lb, Lc)
+
+        ' ---- スナップ（パターン単位） ----
+        Dim snapRel, snapAbs
+        snapRel = "snaps\" & Sanitize(UId(partDoc, part, f, UA)) & "__" & Sanitize(IId(partDoc, part, f, Lb, La, Lc)) & ".png"
+        snapAbs = OUT_DIR & "\" & snapRel
+        If ShouldSnap() Then
+          Capture(partDoc, Array(UA("ref"), UL1("ref"), UL2("ref"), La("ref"), Lb("ref"), Lc("ref")), snapAbs)
+        End If
+
+        ' ---- 行追加 ----
+        rows.Add Array( _
+          partDoc.Name, part.Name, "Face#" & CStr(f), "U+I", _
+          Round(UA("r"),3), Round(UA("ang"),2), Round(UL1("len"),3), Round(UL2("len"),3), Round(U("opening"),3), _
+          Round(La("len"),3), Round(Lb("len"),3), Round(Lc("len"),3), "OK", _
+          Round(dMin,3), snapRel _
+        )
+
+        foundI = True
+        Exit For
+      Next
+
+      ' IがなければU単独で出力（参考用）
+      If Not foundI Then
+        Dim snapRelU, snapAbsU
+        snapRelU = "snaps\" & Sanitize(UId(partDoc, part, f, UA)) & ".png"
+        snapAbsU = OUT_DIR & "\" & snapRelU
+        If ShouldSnap() Then
+          Capture(partDoc, Array(UA("ref"), UL1("ref"), UL2("ref")), snapAbsU)
+        End If
+
+        rows.Add Array( _
+          partDoc.Name, part.Name, "Face#" & CStr(f), "U", _
+          Round(UA("r"),3), Round(UA("ang"),2), Round(UL1("len"),3), Round(UL2("len"),3), Round(U("opening"),3), _
+          "", "", "", "", "", snapRelU _
+        )
+      End If
+
+    Next ' acceptedU
+
+nextFace:
+  Next ' face
+
 End Sub
 
-' ---------------- 幾何 & 補助 ----------------
-Function GetBool(d, k)
-  On Error Resume Next
-  GetBool = CBool(d(k))
-  If Err.Number <> 0 Then GetBool = False
-  On Error GoTo 0
-End Function
+' ===================== 幾何ヘルパ =========================
+Function Arr3(x,y,z) : Arr3 = Array(CDbl(x),CDbl(y),CDbl(z)) : End Function
 
-Function SafeTypeName(o)
-  On Error Resume Next
-  SafeTypeName = TypeName(o)
-  If Err.Number <> 0 Then SafeTypeName = ""
-  On Error GoTo 0
-End Function
-
-Function SafeLike(s, pat)
-  On Error Resume Next
-  SafeLike = (s Like pat)
-  If Err.Number <> 0 Then SafeLike = False
-  On Error GoTo 0
-End Function
-
-Sub FillLine2D(line2d, d)
-  On Error Resume Next
-  Dim p1,p2 : Set p1 = line2d.StartPoint : Set p2 = line2d.EndPoint
-  If (p1 Is Nothing) Or (p2 Is Nothing) Then d("ok")=False: Exit Sub
-  d("x1")=CDbl(p1.X): d("y1")=CDbl(p1.Y)
-  d("x2")=CDbl(p2.X): d("y2")=CDbl(p2.Y)
-  d("len")=Dist2D(d("x1"),d("y1"),d("x2"),d("y2"))
-  d("ok")=True
-  On Error GoTo 0
+Sub NormVec(v)
+  Dim n : n = Sqr(v(0)*v(0)+v(1)*v(1)+v(2)*v(2))
+  If n>0 Then v(0)=v(0)/n: v(1)=v(1)/n: v(2)=v(2)/n
 End Sub
 
-Sub FillArc2D(a, d)
-  On Error Resume Next
-  Dim c : Set c = a.CenterPoint
-  Dim r : r = a.Radius
-  Dim a0 : a0 = a.StartAngle
-  If Err.Number<>0 Then d("ok")=False: Err.Clear: Exit Sub
-  Dim a1 : a1 = a.EndAngle
-  If Err.Number<>0 Then d("ok")=False: Err.Clear: Exit Sub
-  Dim span : span = NormalizeAngle(a1 - a0)
-  d("cx")=CDbl(c.X): d("cy")=CDbl(c.Y)
-  d("r") =CDbl(r)
-  d("a0")=CDbl(a0): d("a1")=CDbl(a1)
-  d("degSpan")=CDbl(span*180#/3.141592653589793#)
-  d("ok")=True
-  On Error GoTo 0
-End Sub
+Function Dot(a,b) : Dot = a(0)*b(0)+a(1)*b(1)+a(2)*b(2) : End Function
 
-Function NormalizeAngle(ang)
-  Const PI=3.141592653589793#
-  NormalizeAngle=ang
-  Do While NormalizeAngle> PI: NormalizeAngle=NormalizeAngle-2*PI: Loop
-  Do While NormalizeAngle<-PI: NormalizeAngle=NormalizeAngle+2*PI: Loop
-  NormalizeAngle=Abs(NormalizeAngle)
+Function Sub3(a,b) : Sub3 = Array(a(0)-b(0), a(1)-b(1), a(2)-b(2)) : End Function
+
+Function Dist3(a,b)
+  Dist3 = Sqr((a(0)-b(0))^2 + (a(1)-b(1))^2 + (a(2)-b(2))^2)
 End Function
 
-Sub ArcEndpoints(cx,cy,r,a0,a1,ByRef sx,ByRef sy,ByRef ex,ByRef ey)
-  sx = cx + r * Cos(a0)
-  sy = cy + r * Sin(a0)
-  ex = cx + r * Cos(a1)
-  ey = cy + r * Sin(a1)
-End Sub
+Function Proj2D(p, o, u, v)
+  Dim w : w = Sub3(p,o)
+  Proj2D = Array(Dot(w,u), Dot(w,v))
+End Function
 
 Function Dist2D(x1,y1,x2,y2)
-  Dist2D=Sqr((x2-x1)*(x2-x1)+(y2-y1)*(y2-y1))
+  Dist2D = Sqr((x2-x1)^2 + (y2-y1)^2)
 End Function
 
-Function Nearly(a,b,tol) : Nearly=(Abs(a-b)<=tol) : End Function
-
-Function InsideCircle(cx,cy,r,x,y)
-  InsideCircle=(Dist2D(cx,cy,x,y) <= r)
-End Function
-
-Function FindLineAtPointKey(lines, x, y, tol, ByRef keyOut, ByRef ox, ByRef oy, ByRef llen, ByRef lname)
-  Dim k
-  For Each k In lines.Keys
-    Dim L : Set L = lines(k)
-    If (Nearly(L("x1"),x,tol) And Nearly(L("y1"),y,tol)) Then
-      keyOut = k: ox=L("x2"): oy=L("y2"): llen=L("len"): lname=""
-      FindLineAtPointKey = True: Exit Function
-    End If
-    If (Nearly(L("x2"),x,tol) And Nearly(L("y2"),y,tol)) Then
-      keyOut = k: ox=L("x1"): oy=L("y1"): llen=L("len"): lname=""
-      FindLineAtPointKey = True: Exit Function
-    End If
-  Next
-  FindLineAtPointKey = False
-End Function
-
-Function RightAngleNeighborsAt(lines, Lb, atStart, tolXY, tolRight)
-  Dim res : Set res = CreateObject("Scripting.Dictionary")
-  Dim bx,by, vx,vy
-  If atStart Then
-    bx=Lb("x1"): by=Lb("y1"): vx=Lb("x2")-Lb("x1"): vy=Lb("y2")-Lb("y1")
-  Else
-    bx=Lb("x2"): by=Lb("y2"): vx=Lb("x1")-Lb("x2"): vy=Lb("y1")-Lb("y2")
-  End If
-  Dim k
-  For Each k In lines.Keys
-    Dim L : Set L = lines(k)
-    If Not (L Is Lb) Then
-      Dim touch : touch=False
-      Dim ux,uy
-      If Nearly(L("x1"),bx,tolXY) And Nearly(L("y1"),by,tolXY) Then
-        ux=L("x2")-L("x1"): uy=L("y2")-L("y1"): touch=True
-      ElseIf Nearly(L("x2"),bx,tolXY) And Nearly(L("y2"),by,tolXY) Then
-        ux=L("x1")-L("x2"): uy=L("y1")-L("y2"): touch=True
-      End If
-      If touch Then
-        Dim ang : ang = AngleBetween(vx,vy, ux,uy)
-        If Abs(ang-90#) <= tolRight Then res.Add k, True
-      End If
-    End If
-  Next
-  Set RightAngleNeighborsAt = res
-End Function
-
-Function AngleBetween(ax,ay,bx,by)
-  Dim da : da=Sqr(ax*ax+ay*ay) : If da=0 Then AngleBetween=0: Exit Function
-  Dim db : db=Sqr(bx*bx+by*by) : If db=0 Then AngleBetween=0: Exit Function
-  Dim d  : d =(ax*bx+ay*by)/(da*db)
+Function Angle2D(ax,ay,bx,by)
+  Dim da : da = Sqr(ax*ax+ay*ay) : If da=0 Then Angle2D=0: Exit Function
+  Dim db : db = Sqr(bx*bx+by*by) : If db=0 Then Angle2D=0: Exit Function
+  Dim d : d = (ax*bx+ay*by)/(da*db)
   If d>1 Then d=1
   If d<-1 Then d=-1
-  AngleBetween = Atn(Sqr(1-d*d)/d)*180#/3.141592653589793#
-  If AngleBetween<0 Then AngleBetween=AngleBetween+180#
+  Angle2D = Atn(Sqr(1-d*d)/d)*180#/3.141592653589793#
+  If Angle2D<0 Then Angle2D=Angle2D+180#
 End Function
 
-Sub FreeEndOppositeTo(L, Lb, tol, ByRef fx, ByRef fy)
-  If (Nearly(L("x1"),Lb("x1"),tol) And Nearly(L("y1"),Lb("y1"),tol)) _
-     Or (Nearly(L("x1"),Lb("x2"),tol) And Nearly(L("y1"),Lb("y2"),tol)) Then
-    fx=L("x2"): fy=L("y2")
-  Else
-    fx=L("x1"): fy=L("y1")
+Function Collinear(p0,pm,p1,tol_mm,tol_deg)
+  ' 3点が一直線か：∠(p0->pm, pm->p1) ≈ 180°
+  Dim a() : a = Sub3(pm,p0)
+  Dim b() : b = Sub3(p1,pm)
+  Dim ax : ax = a(0): Dim ay : ay = a(1): Dim az : az = a(2)
+  Dim bx : bx = b(0): Dim by : by = b(1): Dim bz : bz = b(2)
+  Dim da : da = Sqr(ax*ax+ay*ay+az*az)
+  Dim db : db = Sqr(bx*bx+by*by+bz*bz)
+  If da<tol_mm Or db<tol_mm Then Collinear=False: Exit Function
+  Dim d : d = (ax*bx+ay*by+az*bz)/(da*db)
+  If d>1 Then d=1
+  If d<-1 Then d=-1
+  Dim ang : ang = Atn(Sqr(1-d*d)/d)*180#/3.141592653589793#
+  If ang<0 Then ang=ang+180#
+  Collinear = (Abs(ang-180#) <= tol_deg)
+End Function
+
+Function KeyOfPoint(p)
+  KeyOfPoint = CStr(Round(p(0)/TOL_JOIN,0)) & "|" & CStr(Round(p(1)/TOL_JOIN,0)) & "|" & CStr(Round(p(2)/TOL_JOIN,0))
+End Function
+
+Sub AddEndKey(endMap, ed, keyName)
+  Dim k : k = KeyOfPoint(ed(keyName))
+  If Not endMap.Exists(k) Then
+    Dim lst : Set lst = CreateObject("System.Collections.ArrayList")
+    endMap.Add k, lst
   End If
+  endMap(k).Add ed
 End Sub
 
-Function DistSegToSeg(LA, LB)
-  Dim d1 : d1 = DistPtToSeg(LA("x1"),LA("y1"), LB("x1"),LB("y1"), LB("x2"),LB("y2"))
-  Dim d2 : d2 = DistPtToSeg(LA("x2"),LA("y2"), LB("x1"),LB("y1"), LB("x2"),LB("y2"))
-  Dim d3 : d3 = DistPtToSeg(LB("x1"),LB("y1"), LA("x1"),LA("y1"), LA("x2"),LA("y2"))
-  Dim d4 : d4 = DistPtToSeg(LB("x2"),LB("y2"), LA("x1"),LA("y1"), LA("x2"),LA("y2"))
-  DistSegToSeg = Min4(d1,d2,d3,d4)
+Function LinesAtKey(lines, endMap, key)
+  Dim lst : Set lst = CreateObject("System.Collections.ArrayList")
+  If endMap.Exists(key) Then
+    Dim i
+    For i = 0 To endMap(key).Count-1
+      Dim e : Set e = endMap(key)(i)
+      If e("type")="LINE" Then lst.Add e
+    Next
+  End If
+  Set LinesAtKey = lst
 End Function
 
-Function DistPtToSeg(px,py, x1,y1,x2,y2)
-  Dim vx,vy : vx = x2 - x1 : vy = y2 - y1
-  Dim wx,wy : wx = px - x1 : wy = py - y1
-  Dim vv : vv = vx*vx + vy*vy
-  If vv = 0 Then
-    DistPtToSeg = Sqr((px-x1)*(px-x1) + (py-y1)*(py-y1))
-    Exit Function
+Function EnsureCenter(arc, Optional o, Optional u, Optional v)
+  ' 3D中心が無い場合は端点中点から近似（円の垂直二等分）
+  If arc.Exists("c") Then
+    EnsureCenter = arc("c"): Exit Function
   End If
-  Dim t : t = (wx*vx + wy*vy) / vv
-  If t < 0 Then t = 0
-  If t > 1 Then t = 1
-  Dim cx,cy : cx = x1 + t*vx : cy = y1 + t*vy
-  DistPtToSeg = Sqr((px-cx)*(px-cx) + (py-cy)*(py-cy))
+  ' 近似：フェース2Dに落として二等分線交点で推定
+  Dim p0() : p0 = Proj2D(arc("p0"), o, u, v)
+  Dim pm() : pm = Proj2D(arc("pm"), o, u, v)
+  Dim p1() : p1 = Proj2D(arc("p1"), o, u, v)
+  Dim cx2 : cx2 = (p0(0)+p1(0))/2
+  Dim cy2 : cy2 = (p0(1)+p1(1))/2
+  EnsureCenter = Arr3(cx2*u(0)+cy2*v(0)+o(0), cx2*u(1)+cy2*v(1)+o(1), cx2*u(2)+cy2*v(2)+o(2))
+End Function
+
+Function FreeEnd2D(L, u_end3, u, v, o)
+  ' U端点に接しているLの自由端を2Dで返す
+  Dim k0 : k0 = KeyOfPoint(L("p0"))
+  Dim ku : ku = KeyOfPoint(u_end3)
+  Dim pFree()
+  If k0 = ku Then
+    pFree = Proj2D(L("p1"), o, u, v)
+  Else
+    pFree = Proj2D(L("p0"), o, u, v)
+  End If
+  FreeEnd2D = pFree
+End Function
+
+Function FreeEnd2DAgainst(L, Lb, o, u, v, tolJoin)
+  Dim kB0 : kB0 = KeyOfPoint(Lb("p0"))
+  Dim kB1 : kB1 = KeyOfPoint(Lb("p1"))
+  Dim kL0 : kL0 = KeyOfPoint(L("p0"))
+  Dim kL1 : kL1 = KeyOfPoint(L("p1"))
+  Dim tgt3
+  If kL0=kB0 Or kL0=kB1 Then
+    tgt3 = L("p1")
+  Else
+    tgt3 = L("p0")
+  End If
+  FreeEnd2DAgainst = Proj2D(tgt3, o, u, v)
+End Function
+
+Function SemiPlaneForArc(arc, o, u, v, ByRef cx2, ByRef cy2, ByRef bx, ByRef by)
+  ' 半円の「内側半平面」を定義：端点方向ベクトルの二等分ベクトルで半平面を切る
+  Dim p0() : p0 = Proj2D(arc("p0"), o, u, v)
+  Dim p1() : p1 = Proj2D(arc("p1"), o, u, v)
+  Dim c3() : c3 = EnsureCenter(arc, o, u, v)
+  Dim c2() : c2 = Proj2D(c3, o, u, v)
+  cx2 = c2(0): cy2 = c2(1)
+  Dim v0x : v0x = p0(0)-cx2: Dim v0y : v0y = p0(1)-cy2
+  Dim v1x : v1x = p1(0)-cx2: Dim v1y : v1y = p1(1)-cy2
+  Dim bx0 : bx0 = v0x + v1x
+  Dim by0 : by0 = v0y + v1y
+  Dim nn : nn = Sqr(bx0*bx0+by0*by0)
+  If nn=0 Then bx0=1: by0=0 Else bx0=bx0/nn: by0=by0/nn
+  bx = bx0: by = by0
+End Function
+
+Function InSemiCircle(x,y, cx,cy, bx,by, r)
+  Dim dx : dx = x-cx
+  Dim dy : dy = y-cy
+  If (dx*dx+dy*dy) > (r+0.001)*(r+0.001) Then
+    InSemiCircle = False: Exit Function
+  End If
+  ' 半平面条件： (p-c)·b >= 0
+  InSemiCircle = (dx*bx + dy*by >= -0.001)
+End Function
+
+Function RightNeighbors(lines, Lb, atStart, o, u, v, tolJoin, tolRight)
+  Dim res : Set res = CreateObject("System.Collections.ArrayList")
+  Dim bx,by, ux,uy
+  Dim B0(), B1()
+  B0 = Proj2D(Lb("p0"), o, u, v)
+  B1 = Proj2D(Lb("p1"), o, u, v)
+  If atStart Then
+    bx = B1(0)-B0(0): by = B1(1)-B0(1)
+  Else
+    bx = B0(0)-B1(0): by = B0(1)-B1(1)
+  End If
+
+  Dim k
+  For k = 0 To lines.Count-1
+    Dim L : Set L = lines(k)
+    If (L Is Lb) Then Continue For
+
+    Dim share As Boolean
+    share = (KeyOfPoint(L("p0"))=KeyOfPoint(IIf(atStart,Lb("p0"),Lb("p1"))) Or _
+             KeyOfPoint(L("p1"))=KeyOfPoint(IIf(atStart,Lb("p0"),Lb("p1"))))
+    If Not share Then Continue For
+
+    Dim P0(), P1()
+    P0 = Proj2D(L("p0"), o, u, v)
+    P1 = Proj2D(L("p1"), o, u, v)
+    If atStart Then
+      ux = P1(0)-P0(0): uy = P1(1)-P0(1)
+    Else
+      ux = P0(0)-P1(0): uy = P0(1)-P1(1)
+    End If
+
+    Dim ang : ang = Angle2D(bx,by, ux,uy)
+    If Abs(ang-90#) <= tolRight Then res.Add L
+  Next
+  Set RightNeighbors = res
+End Function
+
+Function MinUtoILines(part, UL1, UL2, La, Lb, Lc)
+  ' 3D最短距離（Measurable.GetMinimumDistance）でU直線2本とI直線3本の最小を返す
+  Dim spa : Set spa = CATIA.ActiveDocument.GetWorkbench("SPAWorkbench")
+  Dim dMin : dMin = 1E+9
+  dMin = Min3( _
+    Min3( MinDist(spa, UL1("ref"), La("ref")), MinDist(spa, UL1("ref"), Lb("ref")), MinDist(spa, UL1("ref"), Lc("ref")) ), _
+    Min3( MinDist(spa, UL2("ref"), La("ref")), MinDist(spa, UL2("ref"), Lb("ref")), MinDist(spa, UL2("ref"), Lc("ref")) ), _
+    dMin _
+  )
+  MinUtoILines = dMin
+End Function
+
+Function MinDist(spa, r1, r2)
+  On Error Resume Next
+  Dim m1 : Set m1 = spa.GetMeasurable(r1)
+  MinDist = m1.GetMinimumDistance(r2)  ' 3D最短距離  :contentReference[oaicite:12]{index=12}
+  If Err.Number<>0 Then MinDist=1E+9: Err.Clear
+  On Error GoTo 0
 End Function
 
 Function Min3(a,b,c)
@@ -427,58 +544,41 @@ Function Min3(a,b,c)
   Min3 = m
 End Function
 
-Function Min4(a,b,c,d)
-  Dim m : m=a : If b<m Then m=b : If c<m Then m=c : If d<m Then m=d
-  Min4 = m
-End Function
-
-' ---- パターン間隔管理 ----
-Function IsFarEnough(anchors, cx, cy, minDist)
-  Dim k
-  For Each k In anchors.Keys
-    Dim s : s = anchors(k)
-    Dim p : p = Split(s, "|")
-    Dim ax : ax = CDbl(p(0))
-    Dim ay : ay = CDbl(p(1))
-    If Dist2D(ax,ay,cx,cy) < minDist Then
-      IsFarEnough = False : Exit Function
-    End If
+Function IsFarFromAnchors(anchors, p, minD)
+  Dim i
+  For i = 0 To anchors.Count-1
+    If Dist3(anchors(i), p) < minD Then IsFarFromAnchors=False: Exit Function
   Next
-  IsFarEnough = True
+  IsFarFromAnchors = True
 End Function
 
-Sub AddAnchor(anchors, cx, cy)
-  anchors.Add CStr(anchors.Count+1), CStr(cx) & "|" & CStr(cy)
-End Sub
+' ===================== スナップ & 出力 =========================
+Function ShouldSnap()
+  gPatCount = gPatCount + 1
+  If Not ENABLE_SNAPS Then ShouldSnap=False: Exit Function
+  If gSnapCount >= SNAP_MAX Then ShouldSnap=False: Exit Function
+  If (gPatCount Mod SNAP_EVERY_N) <> 0 Then ShouldSnap=False: Exit Function
+  ShouldSnap=True
+End Function
 
-' ---- パターン単位スナップショット ----
-Sub CapturePatternSnapshot(partDoc, objs, pngPath)
+Sub Capture(partDoc, refs, pngPath)
   On Error Resume Next
   Dim sel : Set sel = partDoc.Selection
-  Dim part : Set part = partDoc.Part
   sel.Clear
-
   Dim i
-  For i = LBound(objs) To UBound(objs)
-    If Not (objs(i) Is Nothing) Then
-      Dim r : Set r = part.CreateReferenceFromObject(objs(i))
-      If Not r Is Nothing Then sel.Add r
-    End If
+  For i = LBound(refs) To UBound(refs)
+    If Not (refs(i) Is Nothing) Then sel.Add refs(i)
   Next
-
   Dim v : Set v = CATIA.ActiveWindow.ActiveViewer
   v.ReframeOnSelection
-  If Err.Number <> 0 Then
-    Err.Clear
-    v.Reframe
-  End If
-
+  If Err.Number <> 0 Then Err.Clear: v.Reframe
   CATIA.ActiveWindow.CapturePictureFile pngPath, "png"
   sel.Clear
+  gSnapCount = gSnapCount + 1
   On Error GoTo 0
 End Sub
 
-Function SanitizeFileName(s)
+Function Sanitize(s)
   Dim t : t = s
   t = Replace(t, ":", "_")
   t = Replace(t, "|", "_")
@@ -490,7 +590,16 @@ Function SanitizeFileName(s)
   t = Replace(t, "<", "_")
   t = Replace(t, ">", "_")
   t = Replace(t, "&", "_")
-  SanitizeFileName = t
+  Sanitize = t
+End Function
+
+Function UId(doc, part, fIdx, arc)
+  Dim r : r = "U_F" & CStr(fIdx) & "_R" & CStr(Round(arc("r"),3))
+  UId = r
+End Function
+
+Function IId(doc, part, fIdx, Lb, La, Lc)
+  IId = "I_F" & CStr(fIdx)
 End Function
 
 Sub EnsureFolder(path)
@@ -498,78 +607,34 @@ Sub EnsureFolder(path)
   If Not fso.FolderExists(path) Then fso.CreateFolder path
 End Sub
 
-' ---------------- Excel出力（1シート左右並置） ----------------
-Sub ExportExcelOneSheet(rows, snaps, outPath, SnapshotHeight)
-  Dim xl : Set xl = CreateObject("Excel.Application")
-  xl.Visible = False
-  Dim wb : Set wb = xl.Workbooks.Add()
-  Dim sh : Set sh = wb.Sheets(1)
-  sh.Name = "Report"
-
-  ' ---- 左：Results ----
-  Dim headers
-  headers = Array( _
-    "Doc","Part","Body","Sketch","Pattern", _
-    "U_ID","U_R(mm)","U_Ang(deg)","U_L1(mm)","U_L2(mm)","U_Opening(mm)", _
-    "I_ID","I_La(mm)","I_Lb(mm)","I_Lc(mm)","I_RightOK", _
-    "U2I_L1_Min(mm)","U2I_L2_Min(mm)","U2I_Min(mm)","SnapLabel" _
-  )
-
-  Dim c
-  For c = 0 To UBound(headers)
-    sh.Cells(1, c+1).Value = headers(c)
-  Next
-
-  Dim r, rec, rowIdx : rowIdx = 2
-  For Each r In rows.Keys
-    rec = rows(r)
-    For c = 0 To UBound(headers)
-      If c <= UBound(rec) Then sh.Cells(rowIdx, c+1).Value = rec(c)
-    Next
-    rowIdx = rowIdx + 1
-  Next
-
-  sh.Columns("A:T").AutoFit
-
-  ' ---- 右：Snapshots（同一シート右側に配置） ----
-  Dim startCol : startCol = 22  ' 列V以降に配置（A=1, T=20, U=21, V=22）
-  sh.Cells(1, startCol).Value     = "Pattern (SnapLabel)"
-  sh.Cells(1, startCol + 1).Value = "Image"
-  sh.Columns(startCol).ColumnWidth = 48
-  sh.Columns(startCol + 1).ColumnWidth = 48
-
-  Dim idx : idx = 2
-  Dim k
-  For Each k In snaps.Keys
-    sh.Cells(idx, startCol).Value = k
-    Dim path : path = snaps(k)
-    On Error Resume Next
-    Dim pic : Set pic = sh.Pictures().Insert(path)
-    If Err.Number = 0 Then
-      pic.Top  = sh.Cells(idx, startCol + 1).Top
-      pic.Left = sh.Cells(idx, startCol + 1).Left
-      If pic.Height > SnapshotHeight Then
-        Dim scale : scale = SnapshotHeight / pic.Height
-        pic.Height = SnapshotHeight
-        pic.Width  = pic.Width * scale
-      End If
-      idx = idx + Int((pic.Height / sh.Rows(1).Height)) + 2
+Sub BuildHtmlReport(rows, htmlPath)
+  Dim fso : Set fso = CreateObject("Scripting.FileSystemObject")
+  Dim ts  : Set ts  = fso.CreateTextFile(htmlPath, True, True)
+  ts.WriteLine "<!DOCTYPE html><html><head><meta charset='utf-8'><title>U/I 3D Report</title>"
+  ts.WriteLine "<style>body{font-family:Segoe UI,Arial,sans-serif;margin:16px} table{border-collapse:collapse;width:100%} th,td{border:1px solid #ccc;padding:6px 8px;font-size:12px} th{background:#f5f5f5;position:sticky;top:0} .row{display:grid;grid-template-columns:1fr 320px;gap:16px;margin:12px 0;padding:8px;border:1px solid #e5e5e5;border-radius:8px} .snap{border:1px solid #ddd;border-radius:6px;padding:6px;text-align:center}</style>"
+  ts.WriteLine "</head><body><h2>U/I 3D Report</h2>"
+  ts.WriteLine "<p>Total: " & CStr(rows.Count) & "</p>"
+  Dim i
+  For i = 0 To rows.Count-1
+    Dim r : r = rows(i)
+    ts.WriteLine "<div class='row'>"
+    ts.WriteLine "<table><tbody>"
+    ts.WriteLine TR2("Doc", r(0)) & TR2("Part", r(1)) & TR2("Face", r(2)) & TR2("Pattern", r(3))
+    ts.WriteLine TR2("U_R[mm]", r(4)) & TR2("U_Ang[deg]", r(5)) & TR2("U_L1[mm]", r(6)) & TR2("U_L2[mm]", r(7)) & TR2("U_Opening[mm]", r(8))
+    ts.WriteLine TR2("I_La[mm]", r(9)) & TR2("I_Lb[mm]", r(10)) & TR2("I_Lc[mm]", r(11)) & TR2("Right90°", r(12)) & TR2("U↔I MinDist[mm]", r(13))
+    ts.WriteLine "</tbody></table>"
+    Dim img : img = r(14)
+    If Len(img)>0 Then
+      ts.WriteLine "<div class='snap'><img src='" & Replace(img,"\","/") & "' style='max-width:300px;height:" & SNAP_HEIGHT_PX & "px;object-fit:contain'><br><small>" & img & "</small></div>"
     Else
-      Err.Clear
-      idx = idx + 1
+      ts.WriteLine "<div class='snap'><em>no snapshot</em></div>"
     End If
-    On Error GoTo 0
+    ts.WriteLine "</div>"
   Next
-
-  ' 保存
-  On Error Resume Next
-  wb.SaveAs outPath, 51   ' xlOpenXMLWorkbook
-  If Err.Number <> 0 Then
-    Err.Clear
-    wb.SaveAs outPath
-  End If
-  On Error GoTo 0
-
-  wb.Close False
-  xl.Quit
+  ts.WriteLine "</body></html>"
+  ts.Close
 End Sub
+
+Function TR2(k,v)
+  TR2 = "<tr><th>" & k & "</th><td>" & v & "</td></tr>"
+End Function
