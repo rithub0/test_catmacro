@@ -1,774 +1,773 @@
 """
-Uturn(180°円弧+両端2直線) と Iturn(U内のコの字：直角2箇所の3直線) を
-スケッチから抽出 → 寸法計測 → .xlsx 出力（1シート：左=Results, 右=Snapshots）
-さらに、各パターンを選択して ReframeOnSelection で矩形拡大 → PNGスナップ取得。
+U/I 3D Extractor (Python + pywin32)
+===================================
+CATIAの3Dモデルから、指定形状（Uturn: 半円弧+直線2、Iturn: U内のコの字）を抽出して検査し、
+HTMLレポート + PNGスナップで資料化するスクリプト。
 
-要件まとめ
-----------
-- Uturn の円弧半径: 1〜2 mm
-- U/I 抽出時、受理済みパターン（Uの円弧中心）との最小間隔: 100 mm
-- U の直線（2本）と I の直線（3本）とのセグメント最短距離を出力
-- Excelは1シートで、左側が計測表（Results）、右側がスナップ（Snapshots）
+★ポイント
+- スケッチ不要。トポロジ(Topology)の Face / Edge を直接走査。
+- Edgeの「端点/中点」「長さ」「半径」を SPAWorkbench.Measurable から取得。
+  - 弧角 ≈ 長さ / 半径（deg）で半円(≈180°)判定。
+- 面ごとのローカル2D座標系(平面の原点/2軸)に射影し、幾何判定（直角/内側性/距離など）を安定化。
+- U/Iの各候補を検査：半径範囲・直角(90°±tol)・半円内半平面条件・U↔Iの最短距離(3D)。
+- レポートは HTML（左：表、右：サムネ画像）。Excel不要。
+- スナップ撮影は ReframeOnSelection → CapturePictureFile。負荷対策で間引き可。
+
+前提
+----
+- Windows + CATIA V5 がインストールされ、対象 Part/Product を開いた状態で実行
+- Python 3 + pywin32 (pip install pywin32)
+
+使い方
+------
+1) CATIAで Part か Product を開く
+2) 本スクリプトを `ui_3d_report.py` などで保存
+3) `pip install pywin32`
+4) `python ui_3d_report.py`
+5) `C:\temp\ui3d_report\Report.html` と `snaps\*.png` が生成される
 
 注意
 ----
-- 単位は「スケッチ作成の単位（通常は mm）」を前提に計算。
-- このスクリプトは Windows の COM 経由で CATIA と Excel を操作。
-  Mac では動作しないため、必要に応じて仮想環境やリモートWindowsを用意。
+- Macでは pywin32/COM が使えないため、Windows環境が必要（仮想/リモートでも可）
+- CATIAのリリース差でMeasurableの挙動が多少異なることがあります（例外を握り、近似で補完）
 """
 
 from __future__ import annotations
 
 import math
-import fnmatch
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
-    # pywin32 の COM ラッパー。CATIA/Excel を操作するために必須。
-    # pip install pywin32
     import win32com.client as win32
-except ImportError as e:
+except Exception as e:
     raise SystemExit(
-        "pywin32 が必要です。`pip install pywin32` を実行してください。"
+        "pywin32 が必要です。先に `pip install pywin32` を実行してください。"
     ) from e
 
 
-# =============================================================================
-# 設定（プロジェクトごとに調整する想定）
-# =============================================================================
-# 名前フィルタ（スケッチ名 or 要素名が該当する時に優先的に抽出）
-NAME_LIKE_U = "Uturn*"           # "" にすると名前フィルタを無効化
-NAME_LIKE_I = "Iturn*"
+# ========================= ユーザー設定（要件に合わせて調整） =========================
 
-# Uturn 円弧の半径範囲（mm）
-R_MIN = 1.0
-R_MAX = 2.0
+R_MIN: float = 1.0            # U弧 半径下限 [mm]
+R_MAX: float = 2.0            # U弧 半径上限 [mm]
+TOL_DEG_ARC: float = 1.0      # 半円判定 180°±この値 [deg]
+TOL_RIGHT_DEG: float = 3.0    # 直角判定 90°±この値 [deg]
+TOL_JOIN: float = 0.02        # 端点一致（3D）許容 [mm]
+MIN_SPACING3D: float = 100.0  # 採用Uパターンの3D中心どうし最小距離 [mm]
 
-# 幾何判定の許容
-TOL_ANG_DEG = 0.5                # U 円弧角が 180°±TOL_ANG_DEG
-TOL_XY = 0.01                    # 端点一致（mm）
-TOL_RIGHT = 3.0                  # 直角判定（90°±TOL_RIGHT）
+ENABLE_SNAPS: bool = True     # スナップ撮影 ON/OFF
+SNAP_EVERY_N: int = 1         # 何件に1回撮るか（1=毎回、2=2件に1回…）
+SNAP_MAX: int = 200           # 最大撮影枚数
+SNAP_HEIGHT_PX: int = 240     # HTML上のサムネ高さ(px)
 
-# 多数・連続適合時の「採用間引き」：受理済みパターンとの最小距離（mm）
-# （U の円弧中心座標どうしの距離で判定）
-MIN_SPACING = 100.0
+OUT_DIR: str = r"C:\temp\ui3d_report"  # 出力先
+SNAP_DIRNAME: str = "snaps"            # スナップ保存サブフォルダ名
 
-# 出力関連
-OUT_PATH = r"C:\temp\U_I_report.xlsx"     # Excel 出力先
-SNAP_DIR = r"C:\temp\ui_snaps"            # スナップ画像の保存ディレクトリ
-SNAPSHOT_HEIGHT = 240                     # Excel 貼付時の画像高さ（px）
-START_COL_SNAPSHOT = 22                   # 右側の画像カラム開始位置（V列=22）
+# ========================= 内部カウンタ（スナップ間引き用） =========================
 
-# =============================================================================
-# データ構造（読みやすさ・型安全性向上のため dataclass を使用）
-# =============================================================================
+_snap_count = 0
+_pat_count = 0  # パターンのカウント（U+I or U単）
 
 
-@dataclass
-class Line2D:
-    """
-    スケッチ上の 2D 直線を表す。
-    - (x1, y1) と (x2, y2) は端点座標
-    - length は自動計算された長さ
-    - obj は元の CATIA ジオメトリ（COM オブジェクト）
-    - name は CATIA 上の要素名（任意）
-    """
-    x1: float
-    y1: float
-    x2: float
-    y2: float
-    length: float
-    obj: Any
-    name: str = ""
-
-
-@dataclass
-class Arc2D:
-    """
-    スケッチ上の 2D 円弧を表す。
-    - (cx, cy) は中心座標
-    - r は半径
-    - a0, a1 は開始/終了角（ラジアン）
-    - deg_span は円弧角（度）
-    - obj は元の CATIA ジオメトリ（COM オブジェクト）
-    - name は CATIA 上の要素名（任意）
-    """
-    cx: float
-    cy: float
-    r: float
-    a0: float
-    a1: float
-    deg_span: float
-    obj: Any
-    name: str = ""
-
-
-# =============================================================================
-# CATIA 接続
-# =============================================================================
-
-def connect() -> Tuple[Any, Any]:
-    """
-    CATIA.Application に接続し、アクティブドキュメントを取得する。
-
-    Returns
-    -------
-    (app, doc): (CATIA.Application, Document)
-        app: CATIA アプリケーション COM オブジェクト
-        doc: アクティブドキュメント（Part または Product）
-
-    Raises
-    ------
-    RuntimeError
-        アクティブドキュメントが無い場合
-    """
-    # 既存の CATIA セッションにアタッチ（起動していなければエラー）
-    app = win32.Dispatch("CATIA.Application")
-    doc = app.ActiveDocument
-    if doc is None:
-        raise RuntimeError("CATIAで対象ドキュメントを開いてください。")
-    return app, doc
-
-
-# =============================================================================
-# 幾何ユーティリティ（座標・角度・距離などの計算）
-# =============================================================================
-
-def dist2d(x1: float, y1: float, x2: float, y2: float) -> float:
-    """2点間距離（2D のユークリッド距離）を返す。"""
-    return math.hypot(x2 - x1, y2 - y1)
-
-
-def nearly(a: float, b: float, tol: float) -> bool:
-    """a と b が tol 以内で等しいと見なす。"""
-    return abs(a - b) <= tol
-
-
-def normalize_angle(rad: float) -> float:
-    """
-    角度 rad（ラジアン）を [-pi, pi] に畳み込み、その絶対値を返す。
-    円弧角の比較を方向性に依存せず行うために使用。
-    """
-    while rad > math.pi:
-        rad -= 2 * math.pi
-    while rad < -math.pi:
-        rad += 2 * math.pi
-    return abs(rad)
-
-
-def arc_endpoints(cx: float, cy: float, r: float,
-                  a0: float, a1: float) -> Tuple[float, float, float, float]:
-    """
-    円弧の開始・終了点（x, y）を返す。
-    CATIA の Arc2D/Circle2D の StartAngle/EndAngle はラジアン想定。
-    """
-    sx = cx + r * math.cos(a0)
-    sy = cy + r * math.sin(a0)
-    ex = cx + r * math.cos(a1)
-    ey = cy + r * math.sin(a1)
-    return sx, sy, ex, ey
-
-
-def angle_between(ax: float, ay: float, bx: float, by: float) -> float:
-    """
-    ベクトル (ax, ay) と (bx, by) のなす角度（度）を返す。
-    0〜180°の範囲に正規化される。
-    """
-    da = math.hypot(ax, ay)
-    db = math.hypot(bx, by)
-    if da == 0 or db == 0:
-        return 0.0
-    d = (ax * bx + ay * by) / (da * db)
-    d = max(-1.0, min(1.0, d))  # 数値誤差で範囲外に出ないようクリップ
-    deg = math.degrees(math.atan2(math.sqrt(1 - d * d), d))
-    return deg if deg >= 0 else deg + 180.0
-
-
-def inside_circle(cx: float, cy: float, r: float, x: float, y: float) -> bool:
-    """点 (x, y) が半径 r の円（中心 (cx, cy)）の内側にあるか判定。境界含む。"""
-    return dist2d(cx, cy, x, y) <= r
-
-
-def dist_pt_to_seg(px: float, py: float,
-                   x1: float, y1: float, x2: float, y2: float) -> float:
-    """
-    点 (px, py) と線分 [(x1, y1) - (x2, y2)] の最短距離を返す。
-    投影点が線分外なら端点までの距離になる。
-    """
-    vx, vy = x2 - x1, y2 - y1
-    wx, wy = px - x1, py - y1
-    vv = vx * vx + vy * vy
-    if vv == 0:
-        # 長さ0（実質点）へのガード
-        return math.hypot(px - x1, py - y1)
-    t = (wx * vx + wy * vy) / vv  # 最近接点の線分上パラメータ
-    t = 0.0 if t < 0 else (1.0 if t > 1 else t)  # 0〜1にクリップ
-    cx, cy = x1 + t * vx, y1 + t * vy
-    return math.hypot(px - cx, py - cy)
-
-
-def dist_seg_to_seg(la: Line2D, lb: Line2D) -> float:
-    """
-    2つの線分 la, lb の最短距離を返す。
-    端点→相手線分への距離の最小値で十分（2Dではこれで最短距離が得られる）。
-    """
-    d1 = dist_pt_to_seg(la.x1, la.y1, lb.x1, lb.y1, lb.x2, lb.y2)
-    d2 = dist_pt_to_seg(la.x2, la.y2, lb.x1, lb.y1, lb.x2, lb.y2)
-    d3 = dist_pt_to_seg(lb.x1, lb.y1, la.x1, la.y1, la.x2, la.y2)
-    d4 = dist_pt_to_seg(lb.x2, lb.y2, la.x1, la.y1, la.x2, la.y2)
-    return min(d1, d2, d3, d4)
-
-
-def min3(a: float, b: float, c: float) -> float:
-    """3つの値の最小値。可読性のための薄いラッパー。"""
-    return min(a, b, c)
-
-
-# =============================================================================
-# 2D 要素抽出（CATIA の COM オブジェクトを軽く抽象化）
-# =============================================================================
-
-def is_line2d(g: Any) -> bool:
-    """
-    GeometricElement g が Line2D 相当かおおまかに判定。
-    - StartPoint/EndPoint が取れれば Line2D と見なす。
-    """
-    try:
-        _ = g.StartPoint
-        _ = g.EndPoint
-        return True
-    except Exception:
-        return False
-
-
-def is_arc2d(g: Any) -> bool:
-    """
-    GeometricElement g が Arc2D/Circle2D 相当かおおまかに判定。
-    - CenterPoint/Radius/StartAngle/EndAngle が取れれば円弧と見なす。
-    """
-    try:
-        _ = g.CenterPoint
-        _ = g.Radius
-        _ = g.StartAngle
-        _ = g.EndAngle
-        return True
-    except Exception:
-        return False
-
-
-def fill_line2d(g: Any) -> Line2D | None:
-    """
-    CATIA の Line2D から Line2D dataclass を生成。
-    エラー時は None（例えば投影や定義不足など）。
-    """
-    try:
-        p1, p2 = g.StartPoint, g.EndPoint
-        x1, y1 = float(p1.X), float(p1.Y)
-        x2, y2 = float(p2.X), float(p2.Y)
-        return Line2D(
-            x1=x1, y1=y1, x2=x2, y2=y2,
-            length=dist2d(x1, y1, x2, y2),
-            obj=g, name=getattr(g, "Name", "")
-        )
-    except Exception:
-        return None
-
-
-def fill_arc2d(g: Any) -> Arc2D | None:
-    """
-    CATIA の Arc2D/Circle2D から Arc2D dataclass を生成。
-    StartAngle/EndAngle が無い（真円）場合は対象外。
-    """
-    try:
-        c = g.CenterPoint
-        r = float(g.Radius)
-        a0 = float(g.StartAngle)
-        a1 = float(g.EndAngle)
-        span = normalize_angle(a1 - a0)
-        deg_span = math.degrees(span)
-        return Arc2D(
-            cx=float(c.X), cy=float(c.Y), r=r,
-            a0=a0, a1=a1, deg_span=deg_span, obj=g,
-            name=getattr(g, "Name", "")
-        )
-    except Exception:
-        return None
-
-
-# =============================================================================
-# 探索ヘルパ（U の端点に接続する直線、直角接続の探索 など）
-# =============================================================================
-
-def find_line_at_point(lines: Dict[str, Line2D],
-                       x: float, y: float, tol: float
-                       ) -> Tuple[str | None, float, float, float]:
-    """
-    点 (x, y) に端点が一致する線分を検索。
-    一致した場合、その線分キーと「反対側端点座標（=自由端）」、長さを返す。
-    """
-    for k, line in lines.items():
-        if nearly(line.x1, x, tol) and nearly(line.y1, y, tol):
-            return k, line.x2, line.y2, line.length
-        if nearly(line.x2, x, tol) and nearly(line.y2, y, tol):
-            return k, line.x1, line.y1, line.length
-    return None, 0.0, 0.0, 0.0
-
-
-def right_angle_neighbors_at(lines: Dict[str, Line2D],
-                             lb: Line2D,
-                             at_start: bool,
-                             tol_xy: float,
-                             tol_right: float) -> List[str]:
-    """
-    線 lb の start 端 or end 端に直角（90°±tol_right）で接続する線のキー集合を返す。
-    直角判定はベクトル間角度を使用。
-    """
-    bx, by = (lb.x1, lb.y1) if at_start else (lb.x2, lb.y2)
-    vx, vy = ((lb.x2 - lb.x1, lb.y2 - lb.y1)
-              if at_start else (lb.x1 - lb.x2, lb.y1 - lb.y2))
-    result: List[str] = []
-
-    for k, line in lines.items():
-        if line is lb:
-            continue
-
-        # lb の端点 (bx, by) を共有しているか（端点一致）
-        touch = False
-        ux = uy = 0.0
-        if nearly(line.x1, bx, tol_xy) and nearly(line.y1, by, tol_xy):
-            ux, uy = line.x2 - line.x1, line.y2 - line.y1
-            touch = True
-        elif nearly(line.x2, bx, tol_xy) and nearly(line.y2, by, tol_xy):
-            ux, uy = line.x1 - line.x2, line.y1 - line.y2
-            touch = True
-
-        if not touch:
-            continue
-
-        # 直角判定（90°±tol_right）
-        ang = angle_between(vx, vy, ux, uy)
-        if abs(ang - 90.0) <= tol_right:
-            result.append(k)
-
-    return result
-
-
-def free_end_opposite_to(l: Line2D, lb: Line2D, tol: float) -> Tuple[float, float]:
-    """
-    線 l が lb と接していると仮定し、l の「自由端」座標を返す。
-    - l の片端が lb のいずれか端点に一致していれば、もう一端が自由端。
-    """
-    if (nearly(l.x1, lb.x1, tol) and nearly(l.y1, lb.y1, tol)) or \
-       (nearly(l.x1, lb.x2, tol) and nearly(l.y1, lb.y2, tol)):
-        return l.x2, l.y2
-    return l.x1, l.y1
-
-
-# =============================================================================
-# スナップショット撮影（選択 → ReframeOnSelection → PNG保存）
-# =============================================================================
-
-def sanitize_filename(s: str) -> str:
-    """Windows のファイル名に使えない文字をアンダースコアに置換。"""
-    for ch in r':|\/*?"<> &':
-        s = s.replace(ch, "_")
-    return s
-
+# ========================= 汎用ユーティリティ（ベクトル/幾何） =========================
 
 def ensure_folder(path: str) -> None:
     """フォルダが無ければ作成。"""
     Path(path).mkdir(parents=True, exist_ok=True)
 
 
-def capture_pattern_snapshot(part_doc: Any,
-                             objs: List[Any],
-                             png_path: str) -> None:
+def arr3(x: float, y: float, z: float) -> Tuple[float, float, float]:
+    return float(x), float(y), float(z)
+
+
+def v_sub(a: Sequence[float], b: Sequence[float]) -> Tuple[float, float, float]:
+    return a[0] - b[0], a[1] - b[1], a[2] - b[2]
+
+
+def v_dot(a: Sequence[float], b: Sequence[float]) -> float:
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def v_len(a: Sequence[float]) -> float:
+    return math.sqrt(v_dot(a, a))
+
+
+def v_norm(a: Sequence[float]) -> Tuple[float, float, float]:
+    n = v_len(a)
+    return (a[0] / n, a[1] / n, a[2] / n) if n > 0 else (0.0, 0.0, 0.0)
+
+
+def dist3(a: Sequence[float], b: Sequence[float]) -> float:
+    return v_len(v_sub(a, b))
+
+
+def proj2d(p: Sequence[float], o: Sequence[float], u: Sequence[float], v: Sequence[float]) -> Tuple[float, float]:
     """
-    指定オブジェクト群を選択 → ReframeOnSelection → 画像キャプチャ。
-    - ReframeOnSelection が使えない環境では Reframe にフォールバック。
+    面の原点o・面内基底ベクトルu,vを使って3D点pをローカル2D座標へ射影する。
+    x = (p - o)·u, y = (p - o)·v
+    """
+    w = v_sub(p, o)
+    return v_dot(w, u), v_dot(w, v)
+
+
+def dist2d(x1: float, y1: float, x2: float, y2: float) -> float:
+    return math.hypot(x2 - x1, y2 - y1)
+
+
+def angle2d(ax: float, ay: float, bx: float, by: float) -> float:
+    """
+    2Dベクトル(a)と(b)のなす角度（0〜180°）。
+    直角判定や半円内チェック用。
+    """
+    da = math.hypot(ax, ay)
+    db = math.hypot(bx, by)
+    if da == 0 or db == 0:
+        return 0.0
+    d = (ax * bx + ay * by) / (da * db)
+    d = max(-1.0, min(1.0, d))
+    deg = math.degrees(math.atan2(math.sqrt(1 - d * d), d))
+    return deg if deg >= 0 else deg + 180.0
+
+
+def collinear(p0: Sequence[float], pm: Sequence[float], p1: Sequence[float],
+              tol_mm: float = 0.01, tol_deg: float = 0.5) -> bool:
+    """
+    3点が一直線か？
+    ∠(p0→pm, pm→p1) ≈ 180° かどうかで判定する。
+    長さゼロ近傍は除外。
+    """
+    a = v_sub(pm, p0)
+    b = v_sub(p1, pm)
+    la, lb = v_len(a), v_len(b)
+    if la < tol_mm or lb < tol_mm:
+        return False
+    d = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (la * lb)
+    d = max(-1.0, min(1.0, d))
+    ang = math.degrees(math.atan2(math.sqrt(1 - d * d), d))
+    if ang < 0:
+        ang += 180.0
+    return abs(ang - 180.0) <= tol_deg
+
+
+def key_of_point(p: Sequence[float]) -> str:
+    """
+    端点一致のための量子化キー。
+    TOL_JOIN で丸めることで、面取りや数値誤差による微ズレを許容。
+    """
+    q = TOL_JOIN if TOL_JOIN > 0 else 0.01
+    return f"{round(p[0]/q):d}|{round(p[1]/q):d}|{round(p[2]/q):d}"
+
+
+# ========================= データ構造 =========================
+
+@dataclass
+class EdgeData:
+    """1本のエッジ（ARC or LINE）の計測結果。"""
+    ref: Any                        # Edge の Reference
+    type: str                       # "ARC" | "LINE" | "CURVE"
+    p0: Tuple[float, float, float]  # start 3D
+    pm: Tuple[float, float, float]  # mid 3D
+    p1: Tuple[float, float, float]  # end 3D
+    length: float                   # 長さ [mm]
+    radius: Optional[float] = None  # 半径 [mm]（円弧のみ）
+    angle_deg: Optional[float] = None  # 弧角 [deg]（円弧のみ）≈ len/r*180/pi
+    center: Optional[Tuple[float, float, float]] = None  # 中心3D（取れない場合あり）
+
+
+@dataclass
+class UPattern:
+    """Uパターン（半円弧+直線2）"""
+    arc: EdgeData
+    l1: EdgeData
+    l2: EdgeData
+    opening_2d: float                              # Uの開口距離（面2D上での自由端間距離）
+    center3d: Tuple[float, float, float]          # U弧の中心（3D）※近似含む
+
+
+# ========================= CATIA 接続/ラッパ =========================
+
+def connect() -> Tuple[Any, Any]:
+    """
+    CATIA.Application に接続し、アクティブドキュメントを返す。
+    """
+    app = win32.Dispatch("CATIA.Application")
+    doc = app.ActiveDocument
+    if doc is None:
+        raise RuntimeError("CATIAで Part / Product を開いた状態で実行してください。")
+    return app, doc
+
+
+def get_spa(doc: Any) -> Any:
+    """SPAWorkbench を取得（測定API入り口）。"""
+    return doc.GetWorkbench("SPAWorkbench")
+
+
+# ========================= トポロジ走査：Face / Edge 取得 =========================
+
+def search_faces(part_doc: Any) -> List[Any]:
+    """
+    ドキュメント内の全フェースを Selection.Search で取得。
+    検索構文: "Topology.Face,all"
     """
     sel = part_doc.Selection
-    part = part_doc.Part
     sel.Clear()
+    sel.Search("Topology.Face,all")
+    return [sel.Item(i).Reference for i in range(1, sel.Count + 1)]
 
-    # 幾何オブジェクト（COM）から参照を作成して選択セットに追加
-    for obj in objs:
-        if obj is None:
+
+def edges_of_face(part_doc: Any, face_ref: Any) -> List[Any]:
+    """
+    あるフェースの境界エッジ集合を Selection.Search で取得。
+    フェースを選択→ "Topology.Edge,sel" で境界に限定。
+    """
+    sel = part_doc.Selection
+    sel.Clear()
+    sel.Add(face_ref)
+    sel.Search("Topology.Edge,sel")
+    return [sel.Item(i).Reference for i in range(1, sel.Count + 1)]
+
+
+def get_plane(measurable_face: Any) -> Tuple[Tuple[float, float, float],
+                                             Tuple[float, float, float],
+                                             Tuple[float, float, float]]:
+    """
+    Faceの平面情報（原点 + 面内2軸）を取得。
+    measurable.GetPlane() は [Ox,Oy,Oz, Ux,Uy,Uz, Vx,Vy,Vz] を返す想定。
+    """
+    arr = [0.0] * 9
+    measurable_face.GetPlane(arr)  # 例外になる面もある（例：曲面）→呼び出し側でtry
+    origin = arr3(arr[0], arr[1], arr[2])
+    u = v_norm(arr3(arr[3], arr[4], arr[5]))
+    v = v_norm(arr3(arr[6], arr[7], arr[8]))
+    return origin, u, v
+
+
+def edge_measure(spa: Any, edge_ref: Any) -> Optional[EdgeData]:
+    """
+    1本のEdgeから、端点/中点、長さ、半径（あれば）、中心（あれば）を取得。
+    半径>0なら円弧と見なし、弧角[deg] ≈ 長さ/半径*180/pi を付与。
+    直線は、start-mid-end の一直線性で判断（近似）。
+    """
+    try:
+        m = spa.GetMeasurable(edge_ref)
+    except Exception:
+        return None
+
+    # 端点・中点
+    p = [0.0] * 9
+    try:
+        m.GetPointsOnCurve(p)  # start(0..2), mid(3..5), end(6..8)
+    except Exception:
+        return None
+
+    p0 = arr3(p[0], p[1], p[2])
+    pm = arr3(p[3], p[4], p[5])
+    p1 = arr3(p[6], p[7], p[8])
+
+    # 長さ
+    try:
+        length = float(m.Length)
+    except Exception:
+        length = 0.0
+
+    # 半径（取れれば円弧）
+    radius = None
+    angle_deg = None
+    edge_type = "CURVE"
+    center = None
+
+    try:
+        r = float(m.Radius)  # 円/円弧/円筒のとき取れることがある
+        if r > 0:
+            radius = r
+            edge_type = "ARC"
+            angle_deg = (length / r) * (180.0 / math.pi)
+            # 中心（取得できる場合のみ）
+            cc = [0.0] * 3
+            try:
+                m.GetCenter(cc)
+                center = arr3(cc[0], cc[1], cc[2])
+            except Exception:
+                center = None
+    except Exception:
+        # 半径が取れない → 直線かその他
+        if collinear(p0, pm, p1, tol_mm=0.01, tol_deg=0.5):
+            edge_type = "LINE"
+        else:
+            edge_type = "CURVE"
+
+    return EdgeData(
+        ref=edge_ref,
+        type=edge_type,
+        p0=p0,
+        pm=pm,
+        p1=p1,
+        length=length,
+        radius=radius,
+        angle_deg=angle_deg,
+        center=center,
+    )
+
+
+# ========================= U/I 検出ロジック（面単位） =========================
+
+def build_endmap(edges: List[EdgeData]) -> Dict[str, List[EdgeData]]:
+    """
+    端点量子化キー -> その端点を持つエッジ群 のインデックス。
+    U弧端に接続する直線の探索を高速化。
+    """
+    mp: Dict[str, List[EdgeData]] = {}
+    for e in edges:
+        for pt in (e.p0, e.p1):
+            k = key_of_point(pt)
+            mp.setdefault(k, []).append(e)
+    return mp
+
+
+def lines_at_key(endmap: Dict[str, List[EdgeData]], key: str) -> List[EdgeData]:
+    """端点キー key を共有する LINE エッジだけ抽出。"""
+    return [e for e in endmap.get(key, []) if e.type == "LINE"]
+
+
+def ensure_center3d(arc: EdgeData, origin: Tuple[float, float, float],
+                    u: Tuple[float, float, float],
+                    v: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    """
+    円弧中心が取得できない場合、面2Dに射影して端点の二等分点から近似。
+    """
+    if arc.center is not None:
+        return arc.center
+    p0x, p0y = proj2d(arc.p0, origin, u, v)
+    p1x, p1y = proj2d(arc.p1, origin, u, v)
+    cx2 = 0.5 * (p0x + p1x)
+    cy2 = 0.5 * (p0y + p1y)
+    # 2D→3D復元： origin + cx2*u + cy2*v
+    return (
+        origin[0] + cx2 * u[0] + cy2 * v[0],
+        origin[1] + cx2 * u[1] + cy2 * v[1],
+        origin[2] + cx2 * u[2] + cy2 * v[2],
+    )
+
+
+def free_end2d(line: EdgeData, u_end3: Tuple[float, float, float],
+               origin: Tuple[float, float, float],
+               u: Tuple[float, float, float],
+               v: Tuple[float, float, float]) -> Tuple[float, float]:
+    """
+    U弧の端点（3D）に接続している line の「自由端」（反対側端点）を面2Dで返す。
+    """
+    k_line_p0 = key_of_point(line.p0)
+    k_u_end = key_of_point(u_end3)
+    tgt3 = line.p1 if k_line_p0 == k_u_end else line.p0
+    return proj2d(tgt3, origin, u, v)
+
+
+def free_end2d_against(line: EdgeData, lb: EdgeData,
+                       origin: Tuple[float, float, float],
+                       u: Tuple[float, float, float],
+                       v: Tuple[float, float, float]) -> Tuple[float, float]:
+    """
+    line が中央線 Lb と接している前提で、line の自由端を2Dで返す。
+    """
+    k_lb0 = key_of_point(lb.p0)
+    k_lb1 = key_of_point(lb.p1)
+    tgt3 = line.p1 if key_of_point(line.p0) in (k_lb0, k_lb1) else line.p0
+    return proj2d(tgt3, origin, u, v)
+
+
+def semicircle_bisector(arc: EdgeData,
+                        origin: Tuple[float, float, float],
+                        u: Tuple[float, float, float],
+                        v: Tuple[float, float, float]
+                        ) -> Tuple[float, float, float, float]:
+    """
+    半円の「内側」を決めるための半平面定義を返す。
+    - 中心C(2D) = arc中心(3D)を2Dへ射影
+    - 端点ベクトル C→P0, C→P1 の二等分ベクトル b を計算（正規化）
+    内側条件: (P - C)·b >= 0 かつ |P-C| <= r
+    """
+    cx, cy = proj2d(ensure_center3d(arc, origin, u, v), origin, u, v)
+    p0x, p0y = proj2d(arc.p0, origin, u, v)
+    p1x, p1y = proj2d(arc.p1, origin, u, v)
+    v0x, v0y = p0x - cx, p0y - cy
+    v1x, v1y = p1x - cx, p1y - cy
+    bx, by = v0x + v1x, v0y + v1y
+    n = math.hypot(bx, by)
+    if n == 0:
+        bx, by = 1.0, 0.0
+    else:
+        bx, by = bx / n, by / n
+    return cx, cy, bx, by
+
+
+def in_semicircle(x: float, y: float, cx: float, cy: float,
+                  bx: float, by: float, r: float) -> bool:
+    """
+    点(x,y)が半径rの円の内側、かつ二等分ベクトルによる半平面の内側にあるか。
+    """
+    dx, dy = x - cx, y - cy
+    if dx * dx + dy * dy > (r + 1e-3) ** 2:
+        return False
+    return (dx * bx + dy * by) >= -1e-3
+
+
+def right_neighbors(lines: List[EdgeData], lb: EdgeData, at_start: bool,
+                    origin: Tuple[float, float, float],
+                    u: Tuple[float, float, float],
+                    v: Tuple[float, float, float],
+                    tol_right: float = TOL_RIGHT_DEG) -> List[EdgeData]:
+    """
+    Lbの片端に直角(90°±tol)で接続する直線を列挙（面2Dで角度判定）。
+    """
+    b0x, b0y = proj2d(lb.p0, origin, u, v)
+    b1x, b1y = proj2d(lb.p1, origin, u, v)
+    bx = (b1x - b0x) if at_start else (b0x - b1x)
+    by = (b1y - b0y) if at_start else (b0y - b1y)
+
+    key_anchor = key_of_point(lb.p0 if at_start else lb.p1)
+    res: List[EdgeData] = []
+    for L in lines:
+        if L is lb:
             continue
-        try:
-            ref = part.CreateReferenceFromObject(obj)
-            if ref is not None:
-                sel.Add(ref)
-        except Exception:
-            # 一部のオブジェクトで参照作成できない場合があるため握りつぶす
-            pass
+        # 端点共有？
+        if key_of_point(L.p0) != key_anchor and key_of_point(L.p1) != key_anchor:
+            continue
+        p0x, p0y = proj2d(L.p0, origin, u, v)
+        p1x, p1y = proj2d(L.p1, origin, u, v)
+        ux, uy = (p1x - p0x, p1y - p0y) if key_of_point(L.p0) == key_anchor else (p0x - p1x, p0y - p1y)
+        ang = angle2d(bx, by, ux, uy)
+        if abs(ang - 90.0) <= tol_right:
+            res.append(L)
+    return res
 
+
+def min_distance_between_refs(spa: Any, r1: Any, r2: Any) -> float:
+    """
+    Measurable.GetMinimumDistance(ref2) を利用して 3D最短距離を返す。
+    取得できなければ巨大値。
+    """
+    try:
+        m1 = spa.GetMeasurable(r1)
+        d = float(m1.GetMinimumDistance(r2))
+        return d
+    except Exception:
+        return 1e9
+
+
+# ========================= メイン処理（Part / Product） =========================
+
+def scan_part3d(part_doc: Any, rows: List[List[Any]]) -> None:
+    """
+    1 PartDocument を全フェース走査 → U/I検出 → rows にレコードを蓄積。
+    rowsの1レコード：
+      [Doc, Part, FaceId, Pattern, U_R, U_Ang, U_L1, U_L2, Opening,
+       I_La, I_Lb, I_Lc, RightOK, U2I_Min, SnapRelPath]
+    """
+    global _snap_count, _pat_count
+
+    part = part_doc.Part
+    spa = get_spa(part_doc)
+
+    face_refs = search_faces(part_doc)
+    if not face_refs:
+        return
+
+    for f_idx, face_ref in enumerate(face_refs, start=1):
+        # 面の平面が取れない（曲面など）はスキップ
+        try:
+            meas_face = spa.GetMeasurable(face_ref)
+            origin, u, v = get_plane(meas_face)
+        except Exception:
+            continue
+
+        # 面の境界エッジ群を収集
+        edge_refs = edges_of_face(part_doc, face_ref)
+        edges: List[EdgeData] = []
+        for er in edge_refs:
+            ed = edge_measure(spa, er)
+            if ed:
+                edges.append(ed)
+        if not edges:
+            continue
+
+        # U候補：半径/弧角条件を満たす円弧 + 端点接続の直線2本
+        arcs = [e for e in edges if e.type == "ARC" and e.radius and e.angle_deg is not None
+                and (R_MIN <= e.radius <= R_MAX) and (abs(e.angle_deg - 180.0) <= TOL_DEG_ARC)]
+        lines = [e for e in edges if e.type == "LINE"]
+        if not arcs or not lines:
+            continue
+
+        endmap = build_endmap(edges)
+        u_candidates: List[UPattern] = []
+
+        for ua in arcs:
+            k0 = key_of_point(ua.p0)
+            k1 = key_of_point(ua.p1)
+            cand_l1 = lines_at_key(endmap, k0)
+            cand_l2 = lines_at_key(endmap, k1)
+            if not cand_l1 or not cand_l2:
+                continue
+
+            # ここでは最初の組を採用（必要なら最適選択に拡張可）
+            l1 = cand_l1[0]
+            l2 = cand_l2[0]
+
+            # U開口：面2Dで自由端どうしの距離
+            l1_free_x, l1_free_y = free_end2d(l1, ua.p0, origin, u, v)
+            l2_free_x, l2_free_y = free_end2d(l2, ua.p1, origin, u, v)
+            opening = dist2d(l1_free_x, l1_free_y, l2_free_x, l2_free_y)
+
+            c3 = ensure_center3d(ua, origin, u, v)
+            u_candidates.append(UPattern(arc=ua, l1=l1, l2=l2, opening_2d=opening, center3d=c3))
+
+        if not u_candidates:
+            continue
+
+        # U間の最小距離（3D中心）で間引き
+        accepted_u: List[UPattern] = []
+        anchors: List[Tuple[float, float, float]] = []
+        for up in u_candidates:
+            if all(dist3(up.center3d, a) >= MIN_SPACING3D for a in anchors):
+                accepted_u.append(up)
+                anchors.append(up.center3d)
+
+        if not accepted_u:
+            continue
+
+        # I検出（面2Dで直角接続 + U半円内の半平面条件）
+        for up in accepted_u:
+            ua, ul1, ul2 = up.arc, up.l1, up.l2
+            # 半円内半平面ベクトル
+            cx2, cy2, bx, by = semicircle_bisector(ua, origin, u, v)
+            r = ua.radius if ua.radius else 0.0
+
+            found_i = False
+            for lb in lines:
+                # 中央線Lbの両端が半円内か？
+                lb0x, lb0y = proj2d(lb.p0, origin, u, v)
+                lb1x, lb1y = proj2d(lb.p1, origin, u, v)
+                if not (in_semicircle(lb0x, lb0y, cx2, cy2, bx, by, r) and
+                        in_semicircle(lb1x, lb1y, cx2, cy2, bx, by, r)):
+                    continue
+
+                # 直角接続する相手線（両端）
+                s_ng = right_neighbors(lines, lb, at_start=True, origin=origin, u=u, v=v,
+                                       tol_right=TOL_RIGHT_DEG)
+                e_ng = right_neighbors(lines, lb, at_start=False, origin=origin, u=u, v=v,
+                                       tol_right=TOL_RIGHT_DEG)
+                if not s_ng or not e_ng:
+                    continue
+
+                la = s_ng[0]
+                lc = e_ng[0]
+
+                # 自由端も半円内か
+                afx, afy = free_end2d_against(la, lb, origin, u, v)
+                cfx, cfy = free_end2d_against(lc, lb, origin, u, v)
+                if not (in_semicircle(afx, afy, cx2, cy2, bx, by, r) and
+                        in_semicircle(cfx, cfy, cx2, cy2, bx, by, r)):
+                    continue
+
+                # U直線2本 ↔ I直線3本 の3D最短距離の最小
+                spa = get_spa(part_doc)
+                dmin = min(
+                    min(
+                        min_distance_between_refs(spa, up.l1.ref, la.ref),
+                        min_distance_between_refs(spa, up.l1.ref, lb.ref),
+                        min_distance_between_refs(spa, up.l1.ref, lc.ref),
+                    ),
+                    min(
+                        min_distance_between_refs(spa, up.l2.ref, la.ref),
+                        min_distance_between_refs(spa, up.l2.ref, lb.ref),
+                        min_distance_between_refs(spa, up.l2.ref, lc.ref),
+                    ),
+                )
+
+                # スナップ撮影（間引きフラグで制御）
+                snap_rel = f"{SNAP_DIRNAME}/{sanitize(u_id(part_doc, f_idx, ua, up))}__{sanitize(i_id(part_doc, f_idx, lb, la, lc))}.png"
+                snap_abs = str(Path(OUT_DIR, snap_rel))
+                if should_snap():
+                    capture_snapshot(part_doc, [ua.ref, ul1.ref, ul2.ref, la.ref, lb.ref, lc.ref], snap_abs)
+
+                # レコード追加
+                rows.append([
+                    part_doc.Name, part.Name, f"Face#{f_idx}", "U+I",
+                    round(ua.radius or 0.0, 3), round(ua.angle_deg or 0.0, 2),
+                    round(ul1.length, 3), round(ul2.length, 3), round(up.opening_2d, 3),
+                    round(la.length, 3), round(lb.length, 3), round(lc.length, 3), "OK",
+                    round(dmin, 3), snap_rel
+                ])
+                found_i = True
+                break  # このUでは最初のIのみ採用
+
+            if not found_i:
+                # U単独でレコード化（参考）
+                snap_rel = f"{SNAP_DIRNAME}/{sanitize(u_id(part_doc, f_idx, ua, up))}.png"
+                snap_abs = str(Path(OUT_DIR, snap_rel))
+                if should_snap():
+                    capture_snapshot(part_doc, [ua.ref, ul1.ref, ul2.ref], snap_abs)
+
+                rows.append([
+                    part_doc.Name, part.Name, f"Face#{f_idx}", "U",
+                    round(ua.radius or 0.0, 3), round(ua.angle_deg or 0.0, 2),
+                    round(ul1.length, 3), round(ul2.length, 3), round(up.opening_2d, 3),
+                    "", "", "", "", "", snap_rel
+                ])
+
+
+def scan_product3d(prod_doc: Any, rows: List[List[Any]]) -> None:
+    """ProductDocument 配下の Part を順次処理。"""
+    prod = prod_doc.Product
+    for i in range(1, prod.Products.Count + 1):
+        child = prod.Products.Item(i)
+        ref_doc = child.ReferenceProduct.Parent
+        if getattr(ref_doc, "Type", "") == "Part":
+            scan_part3d(ref_doc, rows)
+
+
+# ========================= スナップ & レポート出力 =========================
+
+def should_snap() -> bool:
+    """
+    スナップ撮影の間引き制御：
+    - ENABLE_SNAPS が False → 撮らない
+    - SNAP_MAX に達した → 撮らない
+    - SNAP_EVERY_N の間引き → 例えばN=2なら偶数回のみ撮る
+    """
+    global _snap_count, _pat_count
+    _pat_count += 1
+    if not ENABLE_SNAPS:
+        return False
+    if _snap_count >= SNAP_MAX:
+        return False
+    if (_pat_count % SNAP_EVERY_N) != 0:
+        return False
+    return True
+
+
+def capture_snapshot(part_doc: Any, refs: List[Any], png_path: str) -> None:
+    """
+    選択→ReframeOnSelection（失敗時はReframe）→ CapturePictureFile。
+    画像保存フォルダは事前に作成しておく。
+    """
+    global _snap_count
+    sel = part_doc.Selection
+    sel.Clear()
+    for r in refs:
+        if r is not None:
+            sel.Add(r)
     viewer = part_doc.Application.ActiveWindow.ActiveViewer
     try:
-        # 選択範囲に画面をフィット
         viewer.ReframeOnSelection()
     except Exception:
-        # 古い環境などでメソッドが使えない場合
         viewer.Reframe()
-
-    # 画面キャプチャ（PNG）
+    ensure_folder(str(Path(png_path).parent))
     part_doc.Application.ActiveWindow.CapturePictureFile(png_path, "png")
     sel.Clear()
+    _snap_count += 1
 
 
-# =============================================================================
-# 主要ロジック：スケッチ解析（抽出→計測→スナップ→行レコード構築）
-# =============================================================================
-
-def analyze_sketch(part_doc: Any,
-                   part: Any,
-                   body: Any,
-                   sk: Any,
-                   anchors: List[Tuple[float, float]],
-                   rows: List[List[Any]],
-                   snaps: Dict[str, str]) -> None:
-    """
-    1スケッチを解析して、U→I の組み合わせを探し、行データとスナップを作成。
-    - U: 半径1〜2mm & 180°±Tol の円弧 + 端点一致の2直線
-    - I: 3直線の組で、中央線 Lb の両端が別直線と直角接続、主要点が U 円内
-    - 採用済みパターン（U中心）との距離が MIN_SPACING 未満ならスキップ
-    """
-    geos = getattr(sk, "GeometricElements", None)
-    if geos is None:
-        return
-
-    # スケッチ名が NameLike に合致するなら、要素名が合致しなくても優先的に通す
-    use_u = len(NAME_LIKE_U) > 0
-    use_i = len(NAME_LIKE_I) > 0
-    sketch_has_u = (not use_u) or fnmatch.fnmatch(getattr(sk, "Name", ""), NAME_LIKE_U)
-    sketch_has_i = (not use_i) or fnmatch.fnmatch(getattr(sk, "Name", ""), NAME_LIKE_I)
-
-    # 要素収集（Line2D / Arc2D）
-    lines: Dict[str, Line2D] = {}
-    arcs: Dict[str, Arc2D] = {}
-
-    for i in range(1, int(geos.Count) + 1):
-        g = geos.Item(i)
-
-        if is_line2d(g):
-            line = fill_line2d(g)
-            if line:
-                lines[str(len(lines) + 1)] = line
-
-        elif is_arc2d(g):
-            arc = fill_arc2d(g)
-            # U向けの数値条件（半径 & 角度）を満たす円弧のみ候補に
-            if arc and (R_MIN <= arc.r <= R_MAX) and (abs(arc.deg_span - 180.0) <= TOL_ANG_DEG):
-                # 名前フィルタ：スケッチ名で合致しない場合は、円弧名でもチェック
-                if use_u and not sketch_has_u:
-                    if not fnmatch.fnmatch(getattr(g, "Name", ""), NAME_LIKE_U):
-                        continue
-                arc.name = getattr(g, "Name", "")
-                arcs[str(len(arcs) + 1)] = arc
-
-    if not arcs:
-        return
-
-    # 後続の出力（行データ）で使う識別情報
-    doc_name = getattr(part_doc, "Name", "")
-    part_name = getattr(part, "Name", "")
-    body_name = getattr(body, "Name", "")
-    sk_name = getattr(sk, "Name", "")
-
-    # ---- U 単位でループし、I を探す ----
-    for ak, u in arcs.items():
-        # Uの円弧端点座標を算出
-        sx, sy, ex, ey = arc_endpoints(u.cx, u.cy, u.r, u.a0, u.a1)
-
-        # 端点一致（TOL_XY）する直線を探し、各直線の「自由端（円弧でない側）」を取得
-        k_l1, l1_ox, l1_oy, l1_len = find_line_at_point(lines, sx, sy, TOL_XY)
-        k_l2, l2_ox, l2_oy, l2_len = find_line_at_point(lines, ex, ey, TOL_XY)
-        if not (k_l1 and k_l2):
-            # どちらか片方の端点で直線が見つからないなら U として不成立
-            continue
-
-        # U の開口幅：2直線の「自由端」間距離
-        opening = dist2d(l1_ox, l1_oy, l2_ox, l2_oy)
-        u_id = f"{sk_name}:U{ak}"
-
-        # 多数・連続配置の間引き：既存アンカー（U中心）との距離が MIN_SPACING 未満なら除外
-        if any(dist2d(ax, ay, u.cx, u.cy) < MIN_SPACING for ax, ay in anchors):
-            continue
-
-        found_i = False  # この U に対して I が見つかったかどうか
-
-        # I 候補：中央線 Lb の両端で、別線と直角に接続（90°±TOL_RIGHT）
-        for lk, lb in list(lines.items()):
-            s_ng = right_angle_neighbors_at(lines, lb, at_start=True,
-                                            tol_xy=TOL_XY, tol_right=TOL_RIGHT)
-            e_ng = right_angle_neighbors_at(lines, lb, at_start=False,
-                                            tol_xy=TOL_XY, tol_right=TOL_RIGHT)
-            if not s_ng or not e_ng:
-                continue  # 両端で直角接続する相手がいなければ I 不成立
-
-            for sk1 in s_ng:
-                for sk2 in e_ng:
-                    if sk1 == sk2:
-                        continue  # 同じ線を両端に使うのは不可
-                    la = lines[sk1]
-                    lc = lines[sk2]
-
-                    # I の「自由端」2点（Lbに接していない側）を取得
-                    a_fx, a_fy = free_end_opposite_to(la, lb, TOL_XY)
-                    c_fx, c_fy = free_end_opposite_to(lc, lb, TOL_XY)
-
-                    # I の主要点（Lb両端 + 自由端2点）が U 円の内側にあるか
-                    inside = (
-                        inside_circle(u.cx, u.cy, u.r - 1e-3, lb.x1, lb.y1) and
-                        inside_circle(u.cx, u.cy, u.r - 1e-3, lb.x2, lb.y2) and
-                        inside_circle(u.cx, u.cy, u.r - 1e-3, a_fx, a_fy) and
-                        inside_circle(u.cx, u.cy, u.r - 1e-3, c_fx, c_fy)
-                    )
-                    if not inside:
-                        continue
-
-                    # U の2直線（端点一致で見つけた線）と I の3直線のセグメント最短距離
-                    ul1 = lines[k_l1]
-                    ul2 = lines[k_l2]
-
-                    d_l1a = dist_seg_to_seg(ul1, la)
-                    d_l1b = dist_seg_to_seg(ul1, lb)
-                    d_l1c = dist_seg_to_seg(ul1, lc)
-                    u2i_l1_min = min3(d_l1a, d_l1b, d_l1c)
-
-                    d_l2a = dist_seg_to_seg(ul2, la)
-                    d_l2b = dist_seg_to_seg(ul2, lb)
-                    d_l2c = dist_seg_to_seg(ul2, lc)
-                    u2i_l2_min = min3(d_l2a, d_l2b, d_l2c)
-
-                    u2i_min = min(u2i_l1_min, u2i_l2_min)
-
-                    # I の識別子（中央線キー + 両端キー）
-                    right_ok = "OK"
-                    i_id = f"{sk_name}:I{lk}-{sk1}-{sk2}"
-
-                    # ---- スナップ（パターン単位）----
-                    snap_label = f"{u_id} + {i_id}"
-                    img_path = os.path.join(
-                        SNAP_DIR, sanitize_filename(snap_label) + ".png"
-                    )
-                    capture_pattern_snapshot(
-                        part_doc,
-                        [u.obj, ul1.obj, ul2.obj, la.obj, lb.obj, lc.obj],
-                        img_path,
-                    )
-                    snaps.setdefault(snap_label, img_path)
-
-                    # ---- 行追加（Excel 左表に出す 1 レコード）----
-                    rows.append([
-                        doc_name, part_name, body_name, sk_name, "U+I",
-                        rounder(u_id), round(u.r, 3), round(u.deg_span, 3),
-                        round(l1_len, 3), round(l2_len, 3), round(opening, 3),
-                        rounder(i_id), round(la.length, 3), round(lb.length, 3),
-                        round(lc.length, 3), right_ok,
-                        round(u2i_l1_min, 3), round(u2i_l2_min, 3), round(u2i_min, 3),
-                        snap_label,
-                    ])
-                    found_i = True
-
-                    # この U を採用したのでアンカー追加（以降のパターン間引きに使用）
-                    anchors.append((u.cx, u.cy))
-
-        # I が見つからなかった場合でも U 単独行を出力（スナップは U 要素のみ）
-        if not found_i:
-            snap_label_u = u_id
-            img_path_u = os.path.join(
-                SNAP_DIR, sanitize_filename(snap_label_u) + ".png"
-            )
-            capture_pattern_snapshot(
-                part_doc,
-                [u.obj, lines[k_l1].obj, lines[k_l2].obj],
-                img_path_u,
-            )
-            snaps.setdefault(snap_label_u, img_path_u)
-
-            rows.append([
-                doc_name, part_name, body_name, sk_name, "U",
-                rounder(u_id), round(u.r, 3), round(u.deg_span, 3),
-                round(l1_len, 3), round(l2_len, 3), round(opening, 3),
-                "", "", "", "", "",
-                "", "", "",
-                snap_label_u,
-            ])
-            anchors.append((u.cx, u.cy))
-
-
-def rounder(s: Any) -> Any:
-    """
-    Excel に書くときに、識別子などの文字列が勝手に数値/日付解釈されるのを
-    避けたい場合は、必要に応じて前置記号をつける等の処理をここに実装。
-    今回はそのまま返す（説明用のフック）。
-    """
+def sanitize(s: str) -> str:
+    """ファイル名に使えない/困る文字を安全化。"""
+    for ch in r':|\/*?"<>& ':
+        s = s.replace(ch, "_")
     return s
 
 
-# =============================================================================
-# Part / Product 走査（複数 Part にも対応）
-# =============================================================================
+def u_id(part_doc: Any, face_idx: int, arc: EdgeData, up: UPattern) -> str:
+    """Uパターンの簡易ID（Face番号 + 半径）"""
+    r = arc.radius or 0.0
+    return f"U_F{face_idx}_R{r:.3f}"
 
-def process_part(part_doc: Any,
-                 anchors: List[Tuple[float, float]],
-                 rows: List[List[Any]],
-                 snaps: Dict[str, str]) -> None:
+
+def i_id(part_doc: Any, face_idx: int, lb: EdgeData, la: EdgeData, lc: EdgeData) -> str:
+    """Iパターンの簡易ID。必要なら詳細に拡張可能。"""
+    return f"I_F{face_idx}"
+
+
+def build_html_report(rows: List[List[Any]], html_path: str) -> None:
     """
-    1つの PartDocument を走査し、全 Body → Sketch を解析。
+    HTMLレポートを生成。
+    1件ごとに左：明細表、右：サムネイル画像の2カラムカードで並べる。
     """
-    part = part_doc.Part
-    bodies = getattr(part, "Bodies", None)
-    if bodies is None:
-        return
+    html = []
+    html.append("<!DOCTYPE html><html><head><meta charset='utf-8'><title>U/I 3D Report</title>")
+    html.append(
+        "<style>"
+        "body{font-family:Segoe UI,Arial,sans-serif;margin:16px}"
+        ".row{display:grid;grid-template-columns:1fr 320px;gap:16px;margin:12px 0;padding:8px;"
+        "border:1px solid #e5e5e5;border-radius:8px}"
+        "table{border-collapse:collapse;width:100%}"
+        "th,td{border:1px solid #ccc;padding:6px 8px;font-size:12px}"
+        "th{background:#f5f5f5;position:sticky;top:0}"
+        ".snap{border:1px solid #ddd;border-radius:6px;padding:6px;text-align:center}"
+        "</style></head><body>"
+    )
+    html.append(f"<h2>U/I 3D Report</h2><p>Total: {len(rows)}</p>")
 
-    for b in range(1, int(bodies.Count) + 1):
-        body = bodies.Item(b)
-        sketches = getattr(body, "Sketches", None)
-        if sketches is None:
-            continue
+    def tr(k: str, v: Any) -> str:
+        return f"<tr><th>{k}</th><td>{v}</td></tr>"
 
-        for s in range(1, int(sketches.Count) + 1):
-            sk = sketches.Item(s)
-            analyze_sketch(part_doc, part, body, sk, anchors, rows, snaps)
+    for r in rows:
+        # r = [Doc, Part, FaceId, Pattern, U_R, U_Ang, U_L1, U_L2, Opening,
+        #      I_La, I_Lb, I_Lc, RightOK, U2I_Min, SnapRelPath]
+        snap_rel = r[14] if len(r) > 14 else ""
+        html.append("<div class='row'>")
+        html.append("<table><tbody>")
+        html.append(tr("Doc", r[0]) + tr("Part", r[1]) + tr("Face", r[2]) + tr("Pattern", r[3]))
+        html.append(
+            tr("U_R [mm]", r[4]) + tr("U_Ang [deg]", r[5]) +
+            tr("U_L1 [mm]", r[6]) + tr("U_L2 [mm]", r[7]) + tr("U_Opening [mm]", r[8])
+        )
+        html.append(
+            tr("I_La [mm]", r[9]) + tr("I_Lb [mm]", r[10]) +
+            tr("I_Lc [mm]", r[11]) + tr("Right90°", r[12]) + tr("U↔I MinDist [mm]", r[13])
+        )
+        html.append("</tbody></table>")
 
+        if snap_rel:
+            img_path_web = snap_rel.replace("\\", "/")
+            html.append(
+                f"<div class='snap'><img src='{img_path_web}' "
+                f"style='max-width:300px;height:{SNAP_HEIGHT_PX}px;object-fit:contain'><br>"
+                f"<small>{img_path_web}</small></div>"
+            )
+        else:
+            html.append("<div class='snap'><em>no snapshot</em></div>")
+        html.append("</div>")  # .row
 
-def process_product(prod_doc: Any,
-                    anchors: List[Tuple[float, float]],
-                    rows: List[List[Any]],
-                    snaps: Dict[str, str]) -> None:
-    """
-    ProductDocument を走査し、配下の参照 PartDocument を順次処理。
-    """
-    prod = prod_doc.Product
-    count = int(prod.Products.Count)
-    for i in range(1, count + 1):
-        child = prod.Products.Item(i)
+    html.append("</body></html>")
 
-        # 参照先ドキュメントを取得（PartDocument のはず）
-        ref_doc = child.ReferenceProduct.Parent
-        # CATIA の API では Type で判別（"Part" or "Product" など）
-        if getattr(ref_doc, "Type", "") == "Part":
-            process_part(ref_doc, anchors, rows, snaps)
-
-
-# =============================================================================
-# Excel 出力（1シート左右並置：左=結果、右=スナップ）
-# =============================================================================
-
-def export_excel_one_sheet(rows: List[List[Any]],
-                           snaps: Dict[str, str],
-                           out_path: str) -> None:
-    """
-    Excel の 1 シートに、左側に計測結果（表）、右側にスナップ画像を並置。
-    画像の高さは SNAPSHOT_HEIGHT に収まるよう縮小。
-    """
-    xl = win32.Dispatch("Excel.Application")
-    xl.Visible = False
-    wb = xl.Workbooks.Add()
-    sh = wb.Sheets(1)
-    sh.Name = "Report"
-
-    # 左：ヘッダ行
-    headers = [
-        "Doc", "Part", "Body", "Sketch", "Pattern",
-        "U_ID", "U_R(mm)", "U_Ang(deg)", "U_L1(mm)", "U_L2(mm)", "U_Opening(mm)",
-        "I_ID", "I_La(mm)", "I_Lb(mm)", "I_Lc(mm)", "I_RightOK",
-        "U2I_L1_Min(mm)", "U2I_L2_Min(mm)", "U2I_Min(mm)", "SnapLabel",
-    ]
-    for c, h in enumerate(headers, start=1):
-        sh.Cells(1, c).Value = h
-
-    # 左：データ行
-    for r_idx, rec in enumerate(rows, start=2):
-        for c_idx, val in enumerate(rec, start=1):
-            sh.Cells(r_idx, c_idx).Value = val
-
-    # 列幅自動調整
-    sh.Columns("A:T").AutoFit()
-
-    # 右：Snapshots（START_COL_SNAPSHOT 列から並べる）
-    sc = START_COL_SNAPSHOT
-    sh.Cells(1, sc).Value = "Pattern (SnapLabel)"
-    sh.Cells(1, sc + 1).Value = "Image"
-    sh.Columns(sc).ColumnWidth = 48
-    sh.Columns(sc + 1).ColumnWidth = 48
-
-    row = 2  # 画像開始行
-    for label, path in snaps.items():
-        sh.Cells(row, sc).Value = label
-        try:
-            pic = sh.Pictures().Insert(path)  # 画像挿入
-            pic.Top = sh.Cells(row, sc + 1).Top
-            pic.Left = sh.Cells(row, sc + 1).Left
-
-            # 画像が大きすぎる場合は高さベースでスケール
-            if pic.Height > SNAPSHOT_HEIGHT:
-                scale = SNAPSHOT_HEIGHT / pic.Height
-                pic.Height = SNAPSHOT_HEIGHT
-                pic.Width = pic.Width * scale
-
-            # 画像の高さに応じて次の挿入行をオフセット
-            row += int(pic.Height / sh.Rows(1).Height) + 2
-
-        except Exception:
-            # 画像が見つからない・読み込めない等の場合はスキップ
-            row += 1
-
-    # ファイル保存（.xlsx）。フォルダが無ければ作成。
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    try:
-        wb.SaveAs(out_path, 51)  # 51 = xlOpenXMLWorkbook
-    except Exception:
-        # Excel のバージョンや権限等でエラーの場合のフォールバック
-        wb.SaveAs(out_path)
-
-    wb.Close(SaveChanges=False)
-    xl.Quit()
+    out = Path(html_path)
+    ensure_folder(str(out.parent))
+    out.write_text("\n".join(html), encoding="utf-16")  # 日本語も安全に表示
 
 
-# =============================================================================
-# エントリポイント
-# =============================================================================
+# ========================= エントリーポイント =========================
 
 def main() -> None:
-    """
-    実行手順：
-      1) CATIA を起動して対象 Part / Product を開く
-        （Windows で pip install pywin32。）
-      2) `python u_i_report.py` を実行
-      3) C:\temp\U_I_report.xlsx（1シートで左=Results, 右=Snapshots） と C:\temp\ui_snaps\*.png が生成
+    if not sys.platform.startswith("win"):
+        print("⚠️ 本スクリプトは Windows + CATIA + pywin32 前提です。")
+    ensure_folder(OUT_DIR)
+    ensure_folder(str(Path(OUT_DIR, SNAP_DIRNAME)))
 
-      補足:
-        Excelの「SnapLabel」列は、右側の画像ラベルと一致（行⇔画像の対応確認に便利）。
-        Excelが画像挿入で高さオートに追従しないケースがあり、そこは行のオフセット計算で概ね並ぶよう設定。必要なら SNAPSHOT_HEIGHT や開始列 START_COL_SNAPSHOT を調整。
-        「名前フィルタ」を完全に無視したい場合は NAME_LIKE_U = ""/NAME_LIKE_I = "" と設定。
-    """
-    ensure_folder(SNAP_DIR)
+    app, doc = connect()
+    rows: List[List[Any]] = []
 
-    # CATIA に接続し、アクティブドキュメントを取得
-    _, doc = connect()
-
-    # 出力用コンテナ
-    rows: List[List[Any]] = []                  # 左表の全行
-    snaps: Dict[str, str] = {}                  # 右側のスナップ（label -> path）
-    anchors: List[Tuple[float, float]] = []     # 採用済みパターンのU中心座標
-
-    # ドキュメント種別で処理を分岐（Part or Product）
     doc_type = getattr(doc, "Type", "")
     if doc_type == "Part":
-        process_part(doc, anchors, rows, snaps)
+        scan_part3d(doc, rows)
     elif doc_type == "Product":
-        process_product(doc, anchors, rows, snaps)
+        scan_product3d(doc, rows)
     else:
         raise RuntimeError("Part または Product を開いてください。")
 
-    export_excel_one_sheet(rows, snaps, OUT_PATH)
-    print(f"完了: 行数={len(rows)}  出力={OUT_PATH}")
+    html_path = str(Path(OUT_DIR, "Report.html"))
+    build_html_report(rows, html_path)
+    print(f"完了: {len(rows)} 件 → {html_path}")
 
 
 if __name__ == "__main__":
