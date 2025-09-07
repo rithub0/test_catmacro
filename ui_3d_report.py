@@ -1,16 +1,28 @@
 """
 U/I 3D Extractor (Python + pywin32)
 ===================================
-CATIAの3Dモデルから、指定形状（Uturn: 半円弧+直線2、Iturn: U内のコの字）を抽出して検査し、
+CATIAの3Dモデルから、指定形状（Uturn: 半円弧+直線2、Iturn: U内のコの字）を抽出・検査し、
 HTMLレポート + PNGスナップで資料化するスクリプト。
 
-★ポイント
+今回の変更（重要）
+------------------
+■ 距離指標を更新：
+  - 以前: U直線2本 ↔ I直線3本 の“3D最短距離の最小値”
+  - 変更: U直線2本(u1,u2) と「U直線に平行な I直線2本(la,lc)」の各ペア最短距離を取り、
+          (u1-la, u2-lc) と (u1-lc, u2-la) の 2 通りの対応のそれぞれで
+          「ペア内の最大値（=離れている側）」を計算、その2値の“より小さい方”を採用。
+          ※どちらも“平行”が成立しない場合はフォールバック（UL各々→I2本の最小、の“最大”）。
+
+■ レポート列名を "U↔I ParallelGapMax [mm]" に更新。
+
+ポイント
+--------
 - スケッチ不要。トポロジ(Topology)の Face / Edge を直接走査。
 - Edgeの「端点/中点」「長さ」「半径」を SPAWorkbench.Measurable から取得。
   - 弧角 ≈ 長さ / 半径（deg）で半円(≈180°)判定。
-- 面ごとのローカル2D座標系(平面の原点/2軸)に射影し、幾何判定（直角/内側性/距離など）を安定化。
-- U/Iの各候補を検査：半径範囲・直角(90°±tol)・半円内半平面条件・U↔Iの最短距離(3D)。
-- レポートは HTML（左：表、右：サムネ画像）。Excel不要。
+- 面ごとのローカル2D座標（平面の原点+2軸）に射影して幾何判定（直角/内側性/平行）を安定化。
+- “平行”は 2Dの角度差で評価（TOL_PARALLEL_DEG 以内）。
+- 距離は 3Dの最短距離：Measurable.GetMinimumDistance(ref) を使用。
 - スナップ撮影は ReframeOnSelection → CapturePictureFile。負荷対策で間引き可。
 
 前提
@@ -28,8 +40,8 @@ HTMLレポート + PNGスナップで資料化するスクリプト。
 
 注意
 ----
-- Macでは pywin32/COM が使えないため、Windows環境が必要（仮想/リモートでも可）
-- CATIAのリリース差でMeasurableの挙動が多少異なることがあります（例外を握り、近似で補完）
+- Macでは pywin32/COM が使えないため、Windows環境が必要。
+- CATIAのリリース差でMeasurableの挙動が多少異なることがある（例外は握って近似補完）。
 """
 
 from __future__ import annotations
@@ -55,6 +67,7 @@ R_MIN: float = 1.0            # U弧 半径下限 [mm]
 R_MAX: float = 2.0            # U弧 半径上限 [mm]
 TOL_DEG_ARC: float = 1.0      # 半円判定 180°±この値 [deg]
 TOL_RIGHT_DEG: float = 3.0    # 直角判定 90°±この値 [deg]
+TOL_PARALLEL_DEG: float = 3.0 # ★2D平行判定の許容角[deg]
 TOL_JOIN: float = 0.02        # 端点一致（3D）許容 [mm]
 MIN_SPACING3D: float = 100.0  # 採用Uパターンの3D中心どうし最小距離 [mm]
 
@@ -65,6 +78,7 @@ SNAP_HEIGHT_PX: int = 240     # HTML上のサムネ高さ(px)
 
 OUT_DIR: str = r"C:\temp\ui3d_report"  # 出力先
 SNAP_DIRNAME: str = "snaps"            # スナップ保存サブフォルダ名
+
 
 # ========================= 内部カウンタ（スナップ間引き用） =========================
 
@@ -120,7 +134,7 @@ def dist2d(x1: float, y1: float, x2: float, y2: float) -> float:
 def angle2d(ax: float, ay: float, bx: float, by: float) -> float:
     """
     2Dベクトル(a)と(b)のなす角度（0〜180°）。
-    直角判定や半円内チェック用。
+    直角・平行判定などに使用。
     """
     da = math.hypot(ax, ay)
     db = math.hypot(bx, by)
@@ -312,136 +326,34 @@ def edge_measure(spa: Any, edge_ref: Any) -> Optional[EdgeData]:
     )
 
 
-# ========================= U/I 検出ロジック（面単位） =========================
+# ========================= 新：平行・距離（変更点の中核） =========================
 
-def build_endmap(edges: List[EdgeData]) -> Dict[str, List[EdgeData]]:
+def line_dir_2d(line: EdgeData,
+                origin: Tuple[float, float, float],
+                u: Tuple[float, float, float],
+                v: Tuple[float, float, float]) -> Tuple[float, float]:
     """
-    端点量子化キー -> その端点を持つエッジ群 のインデックス。
-    U弧端に接続する直線の探索を高速化。
+    Lineエッジの2D方向ベクトル（単位化）を返す。
+    - 面ローカル2Dでベクトルを作るのは、3D法線の微傾きにロバストにするため。
     """
-    mp: Dict[str, List[EdgeData]] = {}
-    for e in edges:
-        for pt in (e.p0, e.p1):
-            k = key_of_point(pt)
-            mp.setdefault(k, []).append(e)
-    return mp
+    x0, y0 = proj2d(line.p0, origin, u, v)
+    x1, y1 = proj2d(line.p1, origin, u, v)
+    dx, dy = (x1 - x0), (y1 - y0)
+    n = math.hypot(dx, dy)
+    return (dx / n, dy / n) if n > 0 else (0.0, 0.0)
 
 
-def lines_at_key(endmap: Dict[str, List[EdgeData]], key: str) -> List[EdgeData]:
-    """端点キー key を共有する LINE エッジだけ抽出。"""
-    return [e for e in endmap.get(key, []) if e.type == "LINE"]
-
-
-def ensure_center3d(arc: EdgeData, origin: Tuple[float, float, float],
-                    u: Tuple[float, float, float],
-                    v: Tuple[float, float, float]) -> Tuple[float, float, float]:
+def is_parallel_2d(a: Tuple[float, float],
+                   b: Tuple[float, float],
+                   tol_deg: float = TOL_PARALLEL_DEG) -> bool:
     """
-    円弧中心が取得できない場合、面2Dに射影して端点の二等分点から近似。
+    2Dベクトルの平行判定（角度差）。
+    角度は 0..180° のため、>90° は 180-θ で折り返して 0..90° で評価する。
     """
-    if arc.center is not None:
-        return arc.center
-    p0x, p0y = proj2d(arc.p0, origin, u, v)
-    p1x, p1y = proj2d(arc.p1, origin, u, v)
-    cx2 = 0.5 * (p0x + p1x)
-    cy2 = 0.5 * (p0y + p1y)
-    # 2D→3D復元： origin + cx2*u + cy2*v
-    return (
-        origin[0] + cx2 * u[0] + cy2 * v[0],
-        origin[1] + cx2 * u[1] + cy2 * v[1],
-        origin[2] + cx2 * u[2] + cy2 * v[2],
-    )
-
-
-def free_end2d(line: EdgeData, u_end3: Tuple[float, float, float],
-               origin: Tuple[float, float, float],
-               u: Tuple[float, float, float],
-               v: Tuple[float, float, float]) -> Tuple[float, float]:
-    """
-    U弧の端点（3D）に接続している line の「自由端」（反対側端点）を面2Dで返す。
-    """
-    k_line_p0 = key_of_point(line.p0)
-    k_u_end = key_of_point(u_end3)
-    tgt3 = line.p1 if k_line_p0 == k_u_end else line.p0
-    return proj2d(tgt3, origin, u, v)
-
-
-def free_end2d_against(line: EdgeData, lb: EdgeData,
-                       origin: Tuple[float, float, float],
-                       u: Tuple[float, float, float],
-                       v: Tuple[float, float, float]) -> Tuple[float, float]:
-    """
-    line が中央線 Lb と接している前提で、line の自由端を2Dで返す。
-    """
-    k_lb0 = key_of_point(lb.p0)
-    k_lb1 = key_of_point(lb.p1)
-    tgt3 = line.p1 if key_of_point(line.p0) in (k_lb0, k_lb1) else line.p0
-    return proj2d(tgt3, origin, u, v)
-
-
-def semicircle_bisector(arc: EdgeData,
-                        origin: Tuple[float, float, float],
-                        u: Tuple[float, float, float],
-                        v: Tuple[float, float, float]
-                        ) -> Tuple[float, float, float, float]:
-    """
-    半円の「内側」を決めるための半平面定義を返す。
-    - 中心C(2D) = arc中心(3D)を2Dへ射影
-    - 端点ベクトル C→P0, C→P1 の二等分ベクトル b を計算（正規化）
-    内側条件: (P - C)·b >= 0 かつ |P-C| <= r
-    """
-    cx, cy = proj2d(ensure_center3d(arc, origin, u, v), origin, u, v)
-    p0x, p0y = proj2d(arc.p0, origin, u, v)
-    p1x, p1y = proj2d(arc.p1, origin, u, v)
-    v0x, v0y = p0x - cx, p0y - cy
-    v1x, v1y = p1x - cx, p1y - cy
-    bx, by = v0x + v1x, v0y + v1y
-    n = math.hypot(bx, by)
-    if n == 0:
-        bx, by = 1.0, 0.0
-    else:
-        bx, by = bx / n, by / n
-    return cx, cy, bx, by
-
-
-def in_semicircle(x: float, y: float, cx: float, cy: float,
-                  bx: float, by: float, r: float) -> bool:
-    """
-    点(x,y)が半径rの円の内側、かつ二等分ベクトルによる半平面の内側にあるか。
-    """
-    dx, dy = x - cx, y - cy
-    if dx * dx + dy * dy > (r + 1e-3) ** 2:
-        return False
-    return (dx * bx + dy * by) >= -1e-3
-
-
-def right_neighbors(lines: List[EdgeData], lb: EdgeData, at_start: bool,
-                    origin: Tuple[float, float, float],
-                    u: Tuple[float, float, float],
-                    v: Tuple[float, float, float],
-                    tol_right: float = TOL_RIGHT_DEG) -> List[EdgeData]:
-    """
-    Lbの片端に直角(90°±tol)で接続する直線を列挙（面2Dで角度判定）。
-    """
-    b0x, b0y = proj2d(lb.p0, origin, u, v)
-    b1x, b1y = proj2d(lb.p1, origin, u, v)
-    bx = (b1x - b0x) if at_start else (b0x - b1x)
-    by = (b1y - b0y) if at_start else (b0y - b1y)
-
-    key_anchor = key_of_point(lb.p0 if at_start else lb.p1)
-    res: List[EdgeData] = []
-    for L in lines:
-        if L is lb:
-            continue
-        # 端点共有？
-        if key_of_point(L.p0) != key_anchor and key_of_point(L.p1) != key_anchor:
-            continue
-        p0x, p0y = proj2d(L.p0, origin, u, v)
-        p1x, p1y = proj2d(L.p1, origin, u, v)
-        ux, uy = (p1x - p0x, p1y - p0y) if key_of_point(L.p0) == key_anchor else (p0x - p1x, p0y - p1y)
-        ang = angle2d(bx, by, ux, uy)
-        if abs(ang - 90.0) <= tol_right:
-            res.append(L)
-    return res
+    ang = angle2d(a[0], a[1], b[0], b[1])  # 0..180
+    if ang > 90.0:
+        ang = 180.0 - ang
+    return ang <= tol_deg
 
 
 def min_distance_between_refs(spa: Any, r1: Any, r2: Any) -> float:
@@ -457,6 +369,61 @@ def min_distance_between_refs(spa: Any, r1: Any, r2: Any) -> float:
         return 1e9
 
 
+def parallel_gap_max(spa: Any,
+                     u1: EdgeData, u2: EdgeData,
+                     la: EdgeData, lc: EdgeData,
+                     origin: Tuple[float, float, float],
+                     u: Tuple[float, float, float],
+                     v: Tuple[float, float, float],
+                     tol_deg: float = TOL_PARALLEL_DEG) -> float:
+    """
+    ★新しい距離定義の実装（要求変更点の中核）
+
+    - 入力：U側直線2本(u1,u2) と I側直線2本(la,lc)
+    - 手順：
+      1) 面2Dで各直線の単位方向ベクトルを計算
+      2) 2通りの対応を試す
+         A: (u1-la, u2-lc) が平行なら、その各 3D最短距離 d1,d2 を求め、 gapA = max(d1,d2)
+         B: (u1-lc, u2-la) が平行なら、同様に gapB を計算
+      3) 結果：gap = min(gapA, gapB)（どちらも成立しない場合はフォールバック）
+    - フォールバック：
+         u1→{la,lc} の最小距離と u2→{la,lc} の最小距離を求め、それらの“最大”を返す。
+         （並びや軽い角度ズレがあっても意味のある上限離隔を返すため）
+    """
+    u1_dir = line_dir_2d(u1, origin, u, v)
+    u2_dir = line_dir_2d(u2, origin, u, v)
+    la_dir = line_dir_2d(la, origin, u, v)
+    lc_dir = line_dir_2d(lc, origin, u, v)
+
+    best = None
+
+    # 対応A: (u1-la, u2-lc)
+    okA = is_parallel_2d(u1_dir, la_dir, tol_deg) and is_parallel_2d(u2_dir, lc_dir, tol_deg)
+    if okA:
+        d1 = min_distance_between_refs(spa, u1.ref, la.ref)
+        d2 = min_distance_between_refs(spa, u2.ref, lc.ref)
+        gapA = max(d1, d2)  # 「左右のうち離れている側」
+        best = gapA if best is None else min(best, gapA)
+
+    # 対応B: (u1-lc, u2-la)
+    okB = is_parallel_2d(u1_dir, lc_dir, tol_deg) and is_parallel_2d(u2_dir, la_dir, tol_deg)
+    if okB:
+        d1 = min_distance_between_refs(spa, u1.ref, lc.ref)
+        d2 = min_distance_between_refs(spa, u2.ref, la.ref)
+        gapB = max(d1, d2)
+        best = gapB if best is None else min(best, gapB)
+
+    # フォールバック：平行不成立
+    if best is None:
+        a1 = min(min_distance_between_refs(spa, u1.ref, la.ref),
+                 min_distance_between_refs(spa, u1.ref, lc.ref))
+        a2 = min(min_distance_between_refs(spa, u2.ref, la.ref),
+                 min_distance_between_refs(spa, u2.ref, lc.ref))
+        best = max(a1, a2)
+
+    return float(best)
+
+
 # ========================= メイン処理（Part / Product） =========================
 
 def scan_part3d(part_doc: Any, rows: List[List[Any]]) -> None:
@@ -464,7 +431,7 @@ def scan_part3d(part_doc: Any, rows: List[List[Any]]) -> None:
     1 PartDocument を全フェース走査 → U/I検出 → rows にレコードを蓄積。
     rowsの1レコード：
       [Doc, Part, FaceId, Pattern, U_R, U_Ang, U_L1, U_L2, Opening,
-       I_La, I_Lb, I_Lc, RightOK, U2I_Min, SnapRelPath]
+       I_La, I_Lb, I_Lc, RightOK, U2I_ParallelGapMax, SnapRelPath]
     """
     global _snap_count, _pat_count
 
@@ -561,8 +528,8 @@ def scan_part3d(part_doc: Any, rows: List[List[Any]]) -> None:
                 if not s_ng or not e_ng:
                     continue
 
-                la = s_ng[0]
-                lc = e_ng[0]
+                la = s_ng[0]  # 片側
+                lc = e_ng[0]  # 反対側
 
                 # 自由端も半円内か
                 afx, afy = free_end2d_against(la, lb, origin, u, v)
@@ -571,20 +538,8 @@ def scan_part3d(part_doc: Any, rows: List[List[Any]]) -> None:
                         in_semicircle(cfx, cfy, cx2, cy2, bx, by, r)):
                     continue
 
-                # U直線2本 ↔ I直線3本 の3D最短距離の最小
-                spa = get_spa(part_doc)
-                dmin = min(
-                    min(
-                        min_distance_between_refs(spa, up.l1.ref, la.ref),
-                        min_distance_between_refs(spa, up.l1.ref, lb.ref),
-                        min_distance_between_refs(spa, up.l1.ref, lc.ref),
-                    ),
-                    min(
-                        min_distance_between_refs(spa, up.l2.ref, la.ref),
-                        min_distance_between_refs(spa, up.l2.ref, lb.ref),
-                        min_distance_between_refs(spa, up.l2.ref, lc.ref),
-                    ),
-                )
+                # ★新・距離評価：U直線↔平行I直線ペアの“最大値”、2通り対応の小さい方
+                gap = parallel_gap_max(spa, ul1, ul2, la, lc, origin, u, v, tol_deg=TOL_PARALLEL_DEG)
 
                 # スナップ撮影（間引きフラグで制御）
                 snap_rel = f"{SNAP_DIRNAME}/{sanitize(u_id(part_doc, f_idx, ua, up))}__{sanitize(i_id(part_doc, f_idx, lb, la, lc))}.png"
@@ -598,7 +553,7 @@ def scan_part3d(part_doc: Any, rows: List[List[Any]]) -> None:
                     round(ua.radius or 0.0, 3), round(ua.angle_deg or 0.0, 2),
                     round(ul1.length, 3), round(ul2.length, 3), round(up.opening_2d, 3),
                     round(la.length, 3), round(lb.length, 3), round(lc.length, 3), "OK",
-                    round(dmin, 3), snap_rel
+                    round(gap, 3), snap_rel
                 ])
                 found_i = True
                 break  # このUでは最初のIのみ採用
@@ -712,8 +667,8 @@ def build_html_report(rows: List[List[Any]], html_path: str) -> None:
         return f"<tr><th>{k}</th><td>{v}</td></tr>"
 
     for r in rows:
-        # r = [Doc, Part, FaceId, Pattern, U_R, U_Ang, U_L1, U_L2, Opening,
-        #      I_La, I_Lb, I_Lc, RightOK, U2I_Min, SnapRelPath]
+        # r = [Doc, Part, Face, Pattern, U_R, U_Ang, U_L1, U_L2, Opening,
+        #      I_La, I_Lb, I_Lc, RightOK, U2I_ParallelGapMax, SnapRelPath]
         snap_rel = r[14] if len(r) > 14 else ""
         html.append("<div class='row'>")
         html.append("<table><tbody>")
@@ -724,7 +679,7 @@ def build_html_report(rows: List[List[Any]], html_path: str) -> None:
         )
         html.append(
             tr("I_La [mm]", r[9]) + tr("I_Lb [mm]", r[10]) +
-            tr("I_Lc [mm]", r[11]) + tr("Right90°", r[12]) + tr("U↔I MinDist [mm]", r[13])
+            tr("I_Lc [mm]", r[11]) + tr("Right90°", r[12]) + tr("U↔I ParallelGapMax [mm]", r[13])
         )
         html.append("</tbody></table>")
 
@@ -744,6 +699,137 @@ def build_html_report(rows: List[List[Any]], html_path: str) -> None:
     out = Path(html_path)
     ensure_folder(str(out.parent))
     out.write_text("\n".join(html), encoding="utf-16")  # 日本語も安全に表示
+
+
+# ========================= U/I 検出に必要な補助（前章の続き） =========================
+
+def build_endmap(edges: List[EdgeData]) -> Dict[str, List[EdgeData]]:
+    """
+    端点量子化キー -> その端点を持つエッジ群 のインデックス。
+    U弧端に接続する直線の探索を高速化。
+    """
+    mp: Dict[str, List[EdgeData]] = {}
+    for e in edges:
+        for pt in (e.p0, e.p1):
+            k = key_of_point(pt)
+            mp.setdefault(k, []).append(e)
+    return mp
+
+
+def lines_at_key(endmap: Dict[str, List[EdgeData]], key: str) -> List[EdgeData]:
+    """端点キー key を共有する LINE エッジだけ抽出。"""
+    return [e for e in endmap.get(key, []) if e.type == "LINE"]
+
+
+def ensure_center3d(arc: EdgeData, origin: Tuple[float, float, float],
+                    u: Tuple[float, float, float],
+                    v: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    """
+    円弧中心が取得できない場合、面2Dに射影して端点の二等分点から近似。
+    """
+    if arc.center is not None:
+        return arc.center
+    p0x, p0y = proj2d(arc.p0, origin, u, v)
+    p1x, p1y = proj2d(arc.p1, origin, u, v)
+    cx2 = 0.5 * (p0x + p1x)
+    cy2 = 0.5 * (p0y + p1y)
+    # 2D→3D復元： origin + cx2*u + cy2*v
+    return (
+        origin[0] + cx2 * u[0] + cy2 * v[0],
+        origin[1] + cx2 * u[1] + cy2 * v[1],
+        origin[2] + cx2 * u[2] + cy2 * v[2],
+    )
+
+
+def free_end2d(line: EdgeData, u_end3: Tuple[float, float, float],
+               origin: Tuple[float, float, float],
+               u: Tuple[float, float, float],
+               v: Tuple[float, float, float]) -> Tuple[float, float]:
+    """
+    U弧の端点（3D）に接続している line の「自由端」（反対側端点）を面2Dで返す。
+    """
+    k_line_p0 = key_of_point(line.p0)
+    k_u_end = key_of_point(u_end3)
+    tgt3 = line.p1 if k_line_p0 == k_u_end else line.p0
+    return proj2d(tgt3, origin, u, v)
+
+
+def free_end2d_against(line: EdgeData, lb: EdgeData,
+                       origin: Tuple[float, float, float],
+                       u: Tuple[float, float, float],
+                       v: Tuple[float, float, float]) -> Tuple[float, float]:
+    """
+    line が中央線 Lb と接している前提で、line の自由端を2Dで返す。
+    """
+    k_lb0 = key_of_point(lb.p0)
+    k_lb1 = key_of_point(lb.p1)
+    tgt3 = line.p1 if key_of_point(line.p0) in (k_lb0, k_lb1) else line.p0
+    return proj2d(tgt3, origin, u, v)
+
+
+def semicircle_bisector(arc: EdgeData,
+                        origin: Tuple[float, float, float],
+                        u: Tuple[float, float, float],
+                        v: Tuple[float, float, float]
+                        ) -> Tuple[float, float, float, float]:
+    """
+    半円の「内側」を決めるための半平面定義を返す。
+    - 中心C(2D) = arc中心(3D)を2Dへ射影
+    - 端点ベクトル C→P0, C→P1 の二等分ベクトル b を計算（正規化）
+    内側条件: (P - C)·b >= 0 かつ |P-C| <= r
+    """
+    cx, cy = proj2d(ensure_center3d(arc, origin, u, v), origin, u, v)
+    p0x, p0y = proj2d(arc.p0, origin, u, v)
+    p1x, p1y = proj2d(arc.p1, origin, u, v)
+    v0x, v0y = p0x - cx, p0y - cy
+    v1x, v1y = p1x - cx, p1y - cy
+    bx, by = v0x + v1x, v0y + v1y
+    n = math.hypot(bx, by)
+    if n == 0:
+        bx, by = 1.0, 0.0
+    else:
+        bx, by = bx / n, by / n
+    return cx, cy, bx, by
+
+
+def in_semicircle(x: float, y: float, cx: float, cy: float, bx: float, by: float, r: float) -> bool:
+    """
+    点(x,y)が半径rの円の内側、かつ二等分ベクトルによる半平面の内側にあるか。
+    """
+    dx, dy = x - cx, y - cy
+    if dx * dx + dy * dy > (r + 1e-3) ** 2:
+        return False
+    return (dx * bx + dy * by) >= -1e-3
+
+
+def right_neighbors(lines: List[EdgeData], lb: EdgeData, at_start: bool,
+                    origin: Tuple[float, float, float],
+                    u: Tuple[float, float, float],
+                    v: Tuple[float, float, float],
+                    tol_right: float = TOL_RIGHT_DEG) -> List[EdgeData]:
+    """
+    Lbの片端に直角(90°±tol)で接続する直線を列挙（面2Dで角度判定）。
+    """
+    b0x, b0y = proj2d(lb.p0, origin, u, v)
+    b1x, b1y = proj2d(lb.p1, origin, u, v)
+    bx = (b1x - b0x) if at_start else (b0x - b1x)
+    by = (b1y - b0y) if at_start else (b0y - b1y)
+
+    key_anchor = key_of_point(lb.p0 if at_start else lb.p1)
+    res: List[EdgeData] = []
+    for L in lines:
+        if L is lb:
+            continue
+        # 端点共有？
+        if key_of_point(L.p0) != key_anchor and key_of_point(L.p1) != key_anchor:
+            continue
+        p0x, p0y = proj2d(L.p0, origin, u, v)
+        p1x, p1y = proj2d(L.p1, origin, u, v)
+        ux, uy = (p1x - p0x, p1y - p0y) if key_of_point(L.p0) == key_anchor else (p0x - p1x, p0y - p1y)
+        ang = angle2d(bx, by, ux, uy)
+        if abs(ang - 90.0) <= tol_right:
+            res.append(L)
+    return res
 
 
 # ========================= エントリーポイント =========================
